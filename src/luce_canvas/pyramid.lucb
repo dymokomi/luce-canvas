@@ -1,0 +1,192 @@
+#==============================================================================================
+#
+#   pyramid - A store's coarser levels
+#
+#   DESCRIPTION:
+#       Level 0 of a store is its own tiles. Level L covers 2^L by 2^L of them in one 256 by
+#       256 tile, each texel the average of the 2x2 texels below it, taken in premultiplied
+#       space so soft edges keep their color. A zoomed-out view composites every layer at
+#       its level, so drawing costs what is on screen rather than what the document holds.
+#
+#       Levels are derived: a level tile's key is made from the keys of the tiles it was
+#       made from (at level 0, their stamps), so painting a tile changes the keys of just
+#       the chain above it, and undo brings the old keys, and often the old tiles, back.
+#       They live in a TileCache, are dropped when space is short, and are made again when
+#       asked for — at most one downsample per level for each tile that changed.
+#
+#==============================================================================================
+
+import gpu
+import memory
+from luce_canvas.tiles import Tiles, tile_size, min_u32
+from luce_canvas.cache import TileCache
+from luce_canvas.shaders import halve_frag_words, halve_frag_msl
+from luce_canvas.half import from_half
+from raster_errors import invalid
+
+## Bytes of one rgba16_float tile.
+pub let tile_bytes: usize = 256 * 256 * 8
+
+pub struct Pyramid:
+    var owner: gpu.Device
+    var shader: gpu.Shader
+    var pipeline: gpu.Pipeline
+    var cache: TileCache
+    ## Level tiles made rather than found, for tests and tuning.
+    pub var renders: u64
+
+    ## Levels for stores on `device`, keeping at most `budget` bytes of them.
+    pub static func create(device: gpu.Device, budget: usize) -> Pyramid!:
+        var shader = try gpu.Shader.create(device, halve_frag_words, halve_frag_msl)
+        errdefer shader.destroy()
+        var pipeline = try gpu.Pipeline.create(device, shader, gpu.Blend.replace, gpu.Format.rgba16_float)
+        errdefer pipeline.destroy()
+        var cache = try TileCache.create(budget, tile_bytes)
+        return Pyramid(owner = device, shader = shader, pipeline = pipeline, cache = cache, renders = 0)
+
+    ## Begin a request: every level tile it gets stays until the next one.
+    pub mutating func hold():
+        self.cache.hold()
+
+    ## Cell (`column`, `row`) of `tiles` at `level`, borrowed until the next
+    ## `hold`; none where nothing is (transparent, or for a `mask`, white).
+    pub mutating func texture(tiles: const Tiles*, column: u32, row: u32, level: u32, mask: bool = false) -> gpu.Texture?!:
+        if level == 0:
+            return tiles.texture(column, row)
+        if level > 16:
+            error(invalid, "pyramid levels go up to 16")
+        let key = level_key(tiles, column, row, level, mask)
+        if key == 0:
+            return none
+        if let found = self.cache.find(key):
+            return found
+        # The four finer tiles first, all held, then one pass over them.
+        var parts: gpu.Texture[4]
+        var present: bool[4] = [false, false, false, false]
+        var covered: u32[8]
+        for quarter in 0..<(usize)4:
+            let fine_column = column * 2 + (u32)(quarter % 2)
+            let fine_row = row * 2 + (u32)(quarter // 2)
+            if cell_exists(tiles, fine_column, fine_row, level - 1):
+                if let part = try self.texture(tiles, fine_column, fine_row, level - 1, mask):
+                    parts[quarter] = part
+                    present[quarter] = true
+                covered[quarter * 2] = covered_at(tiles.width(), fine_column, level - 1)
+                covered[quarter * 2 + 1] = covered_at(tiles.height(), fine_row, level - 1)
+        var texture = try gpu.Texture.create(self.owner, tile_size, tile_size, gpu.Format.rgba16_float)
+        errdefer texture.destroy()
+        let frame = try texture.frame()
+        defer frame.release()
+        let target = try frame.value().target()
+        defer target.release()
+        let half = (f64)tile_size * 0.5
+        for quarter in 0..<(usize)4:
+            if not present[quarter]:
+                continue
+            let part = parts[quarter]
+            let x = half * (f64)(quarter % 2)
+            let y = half * (f64)(quarter // 2)
+            var params: f32[5] = [(f32)x, (f32)y, (f32)covered[quarter * 2], (f32)covered[quarter * 2 + 1], 1.0 if mask else 0.0]
+            try gpu.shade(target.value(), self.pipeline, gpu.Rect(x, y, half, half), u8[]((u8*)&params[0], 20), [part], gpu.Filter.nearest)
+        # A quarter with nothing finer is empty: clear to what empty means.
+        discard(try frame.value().present(gpu.Color(1.0, 1.0, 1.0, 1.0) if mask else gpu.Color(0.0, 0.0, 0.0, 0.0)))
+        self.renders += 1
+        try self.cache.put(key, texture, tile_bytes)
+        return texture
+
+    ## What the level tiles keep, in bytes.
+    pub func bytes() -> usize:
+        return self.cache.bytes()
+
+    pub mutating func set_budget(budget: usize):
+        self.cache.set_budget(budget)
+
+    ## Forget every level tile.
+    pub mutating func clear():
+        self.cache.clear()
+
+    pub mutating func destroy():
+        self.cache.destroy()
+        self.pipeline.destroy()
+        self.shader.destroy()
+
+## Whether cell (`column`, `row`) at `level` lies on the store.
+pub func cell_exists(tiles: const Tiles*, column: u32, row: u32, level: u32) -> bool:
+    let span = (u64)tile_size << level
+    return (u64)column * span < (u64)tiles.width() and (u64)row * span < (u64)tiles.height()
+
+## The texels cell `cell` covers along an axis of `extent` pixels at `level`.
+pub func covered_at(extent: u32, cell: u32, level: u32) -> u32:
+    let span = 1u64 << level
+    let first = (u64)cell * (u64)tile_size * span
+    if first >= (u64)extent:
+        return 0
+    return min_u32(tile_size, (u32)(((u64)extent - first + span - 1) // span))
+
+## The key of cell (`column`, `row`) at `level`: its tile's stamp at level 0,
+## else a digest of the four finer keys and where the cell ends; 0 when
+## nothing is under it.
+pub func level_key(tiles: const Tiles*, column: u32, row: u32, level: u32, mask: bool) -> u64:
+    if not cell_exists(tiles, column, row, level):
+        return 0
+    if level == 0:
+        return tiles.stamp(column, row)
+    var digest: u64 = 14695981039346656037
+    var any = false
+    for quarter in 0..<(u32)4:
+        let key = level_key(tiles, column * 2 + quarter % 2, row * 2 + quarter // 2, level - 1, mask)
+        any = any or key != 0
+        digest = (digest ^ key) *% 1099511628211
+    if not any:
+        return 0
+    # Two cells made of the same tiles differ where the store's edge cuts them.
+    digest = (digest ^ (u64)level) *% 1099511628211
+    digest = (digest ^ ((u64)covered_at(tiles.width(), column, level) << 16 | (u64)covered_at(tiles.height(), row, level))) *% 1099511628211
+    digest = (digest ^ (1 if mask else 2)) *% 1099511628211
+    return digest | 1
+
+test "a level averages in premultiplied space, is cached, and follows a painted tile":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    # 600 by 300: 3 by 2 cells; level 1 is 2 by 1, level 2 one cell.
+    var tiles = try Tiles.create(device, 600, 300)
+    defer tiles.destroy()
+    let count = (usize)600 * 300 * 4
+    let pixels = try alloc f32[count] in memory.heap
+    defer free(pixels) in memory.heap
+    for index in 0..<count:
+        pixels[index] = 0.0
+    # Opaque red at (10, 10), half-transparent red at (11, 10), nothing at (10, 11), (11, 11).
+    pixels[(10 * 600 + 10) * 4] = 1.0
+    pixels[(10 * 600 + 10) * 4 + 3] = 1.0
+    pixels[(10 * 600 + 11) * 4] = 1.0
+    pixels[(10 * 600 + 11) * 4 + 3] = 0.5
+    try tiles.write(pixels)
+    var pyramid = try Pyramid.create(device, 64 * tile_bytes)
+    defer pyramid.destroy()
+    pyramid.hold()
+    let level = try pyramid.texture(&tiles, 0, 0, 1) else trap("a painted cell has a level")
+    var bytes: u8[8]
+    try level.read(bytes, gpu.Region(5, 5, 1, 1))
+    # Straight red stays red (a straight average would give 0.75); alpha is 1.5 / 4.
+    assert(channel(bytes, 0) > 0.99 and channel(bytes, 1) < 0.01 and channel(bytes, 3) > 0.37 and channel(bytes, 3) < 0.38)
+    # Empty cells have no level tile; the same request again is found.
+    assert((try pyramid.texture(&tiles, 1, 0, 1)) == none and pyramid.renders == 1)
+    discard(try pyramid.texture(&tiles, 0, 0, 1))
+    assert(pyramid.renders == 1)
+    # Level 2 covers everything through level 1.
+    discard(try pyramid.texture(&tiles, 0, 0, 2))
+    assert(pyramid.renders == 2)
+    # Painting a tile changes its chain's keys.
+    let before = level_key(&tiles, 0, 0, 2, false)
+    try tiles.set(0, 0, try tiles.blank())
+    assert(level_key(&tiles, 0, 0, 2, false) != before)
+    # A mask's empty cells are white; its level of nothing is none (white too).
+    assert((try pyramid.texture(&tiles, 1, 0, 1, true)) == none)
+    assert(covered_at(600, 1, 1) == 44 and covered_at(300, 0, 1) == 150 and covered_at(600, 2, 1) == 0)
+
+## Channel `index` of an rgba16_float texel's bytes.
+func channel(bytes: const u8[], index: usize) -> f32:
+    return from_half((u16)bytes[index * 2] | ((u16)bytes[index * 2 + 1] << 8))

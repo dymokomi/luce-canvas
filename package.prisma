@@ -15,6 +15,14 @@ def package "luce-canvas" {
         str module = "luce_canvas.half"
     }
 
+    def export "pyramid" {
+        str module = "luce_canvas.pyramid"
+    }
+
+    def export "tile_cache" {
+        str module = "luce_canvas.cache"
+    }
+
     def dependency "luce-gpu" {
         str owner = "dymokomi"
         str version = "^0.1.8"

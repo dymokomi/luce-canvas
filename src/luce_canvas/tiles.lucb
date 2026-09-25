@@ -7,6 +7,8 @@
 ## working space (linear light).
 import gpu
 import memory
+import os
+import thread
 from luce_canvas.half import to_half, from_half
 from raster_errors import invalid, limit
 
@@ -198,32 +200,29 @@ pub struct Tiles:
         return texture
 
     ## Replace every pixel from straight-alpha RGBA f32 samples, top-down, four
-    ## per pixel. Transparent tiles stay `none`.
+    ## per pixel. Transparent tiles stay `none`. A row of cells at a time is
+    ## converted to half floats on every processor, then uploaded whole (the
+    ## padding past the extent zeroed), so no tile needs clearing first.
     pub mutating func write(pixels: const f32[]) -> !:
         if pixels.length != (usize)self.extent_x * (usize)self.extent_y * 4:
             error(invalid, "pixel data must hold width * height RGBA samples")
-        let bytes = try alloc u8[(usize)tile_size * (usize)tile_size * 8] in memory.heap
-        defer free(bytes) in memory.heap
+        let columns = (usize)self.cell_columns
+        let per_tile = (usize)tile_size * (usize)tile_size * 8
+        let band = try alloc u8[columns * per_tile] in memory.heap
+        defer free(band) in memory.heap
+        let painted = try alloc bool[columns] in memory.heap
+        defer free(painted) in memory.heap
         for row in 0..<self.cell_rows:
+            var job = WriteJob(pixels = pixels, band = band, painted = painted, extent_x = self.extent_x, extent_y = self.extent_y, row = row, first = 0, last = columns)
+            try run_bands(&job, columns)
             for column in 0..<self.cell_columns:
-                let area = self.region(column, row)
-                var opaque = false
-                for y in 0..<(usize)area.height:
-                    for x in 0..<(usize)area.width:
-                        let source = (((usize)row * (usize)tile_size + y) * (usize)self.extent_x + (usize)column * (usize)tile_size + x) * 4
-                        let destination = (y * (usize)tile_size + x) * 8
-                        for channel in 0..<(usize)4:
-                            let half = to_half(pixels[source + channel])
-                            bytes[destination + channel * 2] = (u8)(half & 0xff)
-                            bytes[destination + channel * 2 + 1] = (u8)(half >> 8)
-                        if pixels[source + 3] != 0.0:
-                            opaque = true
-                if not opaque:
+                if not painted[(usize)column]:
                     try self.clear(column, row)
                     continue
-                var texture = try self.blank()
+                var texture = try gpu.Texture.create(self.owner, tile_size, tile_size, gpu.Format.rgba16_float)
                 errdefer texture.destroy()
-                try texture.upload(bytes[..<((usize)area.height * (usize)tile_size * 8)], gpu.Region(0, 0, tile_size, area.height))
+                let at = (usize)column * per_tile
+                try texture.upload(band[at..<at + per_tile])
                 try self.set(column, row, texture)
 
     ## Upload one cell from `pixels`, premultiplied RGBA f32 for the whole
@@ -528,6 +527,76 @@ pub func min_u32(a: u32, b: u32) -> u32:
 
 ## The larger of two unsigned sizes.
 pub func max_u32(a: u32, b: u32) -> u32:
+    return a if a > b else b
+
+## One row of cells for `Tiles.write`: cells `first..<last` of `row`, each
+## converted into its place in `band`, `painted` saying whether it holds anything.
+struct WriteJob:
+    var pixels: const f32[]
+    var band: u8[]
+    var painted: bool[]
+    var extent_x: u32
+    var extent_y: u32
+    var row: u32
+    var first: usize
+    var last: usize
+
+func write_entry(context: void*?):
+    write_cells((WriteJob*)(context else return))
+
+func write_cells(job: WriteJob*):
+    let per_tile = (usize)tile_size * (usize)tile_size * 8
+    let top = (usize)job.row * (usize)tile_size
+    let height = min_usize((usize)tile_size, (usize)job.extent_y - top)
+    for column in job.first..<job.last:
+        let left = column * (usize)tile_size
+        let width = min_usize((usize)tile_size, (usize)job.extent_x - left)
+        let bytes = job.band[column * per_tile..<(column + 1) * per_tile]
+        var opaque = false
+        for y in 0..<(usize)tile_size:
+            for x in 0..<(usize)tile_size:
+                let destination = (y * (usize)tile_size + x) * 8
+                if y >= height or x >= width:
+                    for index in 0..<(usize)8:
+                        bytes[destination + index] = 0
+                    continue
+                let source = ((top + y) * (usize)job.extent_x + left + x) * 4
+                for channel in 0..<(usize)4:
+                    let half = to_half(job.pixels[source + channel])
+                    bytes[destination + channel * 2] = (u8)(half & 0xff)
+                    bytes[destination + channel * 2 + 1] = (u8)(half >> 8)
+                if job.pixels[source + 3] != 0.0:
+                    opaque = true
+        job.painted[column] = opaque
+
+## `job`'s cells split over the processors, this thread taking the first share.
+func run_bands(job: WriteJob*, count: usize) -> !:
+    let workers = min_usize(16, min_usize(count, max_usize(1, (usize)os.cpus())))
+    if workers <= 1:
+        write_cells(job)
+        return
+    var shares: WriteJob[16]
+    var handles: thread.Handle[16]
+    var started: usize = 0
+    let per = (count + workers - 1) // workers
+    for share in 0..<workers:
+        shares[share] = *job
+        shares[share].first = min_usize(count, share * per)
+        shares[share].last = min_usize(count, share * per + per)
+    for share in 1..<workers:
+        handles[started] = thread.spawn(write_entry, (void*)&shares[share], name = "tiles-write") catch failure:
+            for other in share..<workers:
+                write_cells(&shares[other])
+            break
+        started += 1
+    write_cells(&shares[0])
+    for index in 0..<started:
+        try handles[index].join()
+
+func min_usize(a: usize, b: usize) -> usize:
+    return a if a < b else b
+
+func max_usize(a: usize, b: usize) -> usize:
     return a if a > b else b
 
 ## Every tile of `tiles` drawn into one texture of the whole extent, as stored;

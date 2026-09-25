@@ -13,6 +13,10 @@ fast on ordinary machines. The design is in luced-2d's
 - `tiles`: `Tiles`, a layer's grid of shared tiles over its extent, with the cells kept
   past the canvas.
 - `half`: IEEE 754 binary16 conversion for `rgba16_float` texels.
+- `pyramid`: a store's coarser levels, averaged in premultiplied space, keyed by
+  content and made on demand.
+- `cache`: derived tiles by content key within a byte budget.
+- `keymap`: the hash table behind the cache.
 
 ## Testing
 

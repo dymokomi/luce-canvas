@@ -1,0 +1,153 @@
+#==============================================================================================
+#
+#   keymap - Content keys to cache slots
+#
+#   DESCRIPTION:
+#       An open-addressed table from a nonzero 64-bit key to a slot number, for the caches of
+#       derived tiles: lookups cost the same however many tiles are cached. Linear probing,
+#       with removal by shifting later entries back, so no tombstones pile up. Zero is not a
+#       key: it marks an empty place.
+#
+#==============================================================================================
+
+import memory
+from raster_errors import invalid
+
+pub struct KeyMap:
+    var keys: u64[]
+    var slots: u32[]
+    var count: usize
+
+    ## A table for up to `capacity` keys.
+    pub static func create(capacity: usize) -> KeyMap!:
+        var size: usize = 16
+        while size < capacity * 2:
+            size *= 2
+        let keys = try alloc u64[size] in memory.heap
+        errdefer free(keys) in memory.heap
+        let slots = try alloc u32[size] in memory.heap
+        for index in 0..<size:
+            keys[index] = 0
+            slots[index] = 0
+        return KeyMap(keys = keys, slots = slots, count = 0)
+
+    ## The slot kept for `key`, or none.
+    pub func find(key: u64) -> u32?:
+        if key == 0:
+            return none
+        let mask = self.keys.length - 1
+        var at = (usize)spread(key) & mask
+        while self.keys[at] != 0:
+            if self.keys[at] == key:
+                return self.slots[at]
+            at = (at + 1) & mask
+        return none
+
+    ## Keep `slot` for `key`, replacing what was kept for it.
+    pub mutating func put(key: u64, slot: u32) -> !:
+        if key == 0:
+            error(invalid, "zero is not a key")
+        let mask = self.keys.length - 1
+        var at = (usize)spread(key) & mask
+        while self.keys[at] != 0:
+            if self.keys[at] == key:
+                self.slots[at] = slot
+                return
+            at = (at + 1) & mask
+        if (self.count + 1) * 2 > self.keys.length:
+            error(invalid, "the key map is full")
+        self.keys[at] = key
+        self.slots[at] = slot
+        self.count += 1
+
+    ## Forget `key`, if kept.
+    pub mutating func remove(key: u64):
+        if key == 0:
+            return
+        let mask = self.keys.length - 1
+        var at = (usize)spread(key) & mask
+        while self.keys[at] != key:
+            if self.keys[at] == 0:
+                return
+            at = (at + 1) & mask
+        self.keys[at] = 0
+        self.count -= 1
+        # Shift back what follows in the run, so every key stays reachable from its home.
+        var next = (at + 1) & mask
+        while self.keys[next] != 0:
+            let home = (usize)spread(self.keys[next]) & mask
+            # Move it into the hole when the hole lies between its home and where it is.
+            let between = (next > at and (home <= at or home > next)) or (next < at and home <= at and home > next)
+            if between:
+                self.keys[at] = self.keys[next]
+                self.slots[at] = self.slots[next]
+                self.keys[next] = 0
+                at = next
+            next = (next + 1) & mask
+
+    pub func size() -> usize:
+        return self.count
+
+    pub mutating func clear():
+        for index in 0..<self.keys.length:
+            self.keys[index] = 0
+        self.count = 0
+
+    pub mutating func destroy():
+        if self.keys.length > 0:
+            free(self.keys) in memory.heap
+            free(self.slots) in memory.heap
+        var no_keys: u64[]
+        var no_slots: u32[]
+        self.keys = no_keys
+        self.slots = no_slots
+        self.count = 0
+
+## Keys are already hashes, but their low bits may repeat: mix them once more.
+func spread(key: u64) -> u64:
+    var mixed = key ^ (key >> 33)
+    mixed = mixed *% 0xff51afd7ed558ccd
+    return mixed ^ (mixed >> 33)
+
+test "keys are found, replaced and removed, and every other key stays reachable":
+    var map = try KeyMap.create(64)
+    defer map.destroy()
+    for key in 1..<(u64)65:
+        try map.put(key * 7919, (u32)key)
+    assert(map.size() == 64)
+    for key in 1..<(u64)65:
+        assert((map.find(key * 7919) else 0) == (u32)key)
+    try map.put(7919, 500)
+    assert((map.find(7919) else 0) == 500 and map.size() == 64)
+    for key in 1..<(u64)65:
+        if key % 3 == 0:
+            map.remove(key * 7919)
+    for key in 1..<(u64)65:
+        if key % 3 == 0:
+            assert(map.find(key * 7919) == none)
+        elif key != 1:
+            assert((map.find(key * 7919) else 0) == (u32)key)
+    assert(map.find(0) == none and map.find(12345) == none)
+
+test "random puts and removes agree with a plain table":
+    var map = try KeyMap.create(200)
+    defer map.destroy()
+    # Keys 1..300 by index; 0 in the reference means absent.
+    var reference: u32[301]
+    for index in 0..<(usize)301:
+        reference[index] = 0
+    var seed: u64 = 12345
+    for step in 0..<(u32)20000:
+        seed = seed *% 6364136223846793005 +% 1442695040888963407
+        let key = (seed >> 33) % 300 + 1
+        let putting = (seed >> 20) % 3 != 0
+        if putting and (reference[(usize)key] != 0 or map.size() < 200):
+            try map.put(key *% 0x9e3779b97f4a7c15, step + 1)
+            reference[(usize)key] = step + 1
+        elif not putting:
+            map.remove(key *% 0x9e3779b97f4a7c15)
+            reference[(usize)key] = 0
+        if step % 997 == 0:
+            for check in 1..<(u64)301:
+                let found = map.find(check *% 0x9e3779b97f4a7c15) else 0
+                assert(found == reference[(usize)check])
