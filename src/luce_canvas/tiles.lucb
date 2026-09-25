@@ -152,6 +152,18 @@ pub struct Tiles:
             release(previous)
         self.cells[index] = tile
 
+    ## Put the tile of cell (`from_column`, `from_row`) at (`column`, `row`) too,
+    ## shared: a store of many equal cells (a selection's fully selected ones)
+    ## keeps one tile for them all. An empty source empties the cell.
+    pub mutating func share(column: u32, row: u32, from_column: u32, from_row: u32) -> !:
+        let index = try self.index(column, row)
+        let source = self.cells[try self.index(from_column, from_row)]
+        if let previous = self.cells[index]:
+            release(previous)
+        self.cells[index] = none
+        if let tile = source:
+            self.cells[index] = retain(tile)
+
     ## The cell's content stamp, 0 when transparent: it changes whenever the
     ## cell's pixels do.
     pub func stamp(column: u32, row: u32) -> u64:
@@ -650,6 +662,9 @@ test "tiles share, replace, write and read on a device":
     assert(back[0] == 0.0 and back[count - 1] == 0.0)
     try tiles.read(back)
     assert(back[(10 * 300 + 20) * 4] == 0.0 and back[(258 * 300 + 270) * 4 + 3] == 0.5)
+    # A shared cell holds the same tile, and stamp, as its source.
+    try copy.share(1, 0, 0, 0)
+    assert(copy.stamp(1, 0) == copy.stamp(0, 0) and copy.texture(1, 0) != none)
     var rejected = false
     tiles.set(5, 0, try tiles.blank()) catch failure:
         assert(failure.code == invalid)
