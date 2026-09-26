@@ -13,6 +13,10 @@
 #       the GPU's budget (tiles/governor), and while the GPU is short it keeps only the
 #       governor's `cache_scale` of its budget.
 #
+#       Some tiles are precious: costly to make again (a pyramid's coarse levels are made from
+#       everything under them) and few. Room is made from every other tile first; a precious
+#       tile goes only when precious tiles alone are over the budget.
+#
 #==============================================================================================
 
 import gpu
@@ -30,12 +34,16 @@ struct CacheEntry:
     ## The clock's second chance.
     var recent: bool
     var live: bool
+    ## Costly to make again: dropped only after every other tile.
+    var precious: bool
 
 pub struct TileCache:
     var entries: CacheEntry[]
     var map: KeyMap
     var budget: usize
     var held_bytes: usize
+    ## Of those, the precious tiles' bytes.
+    var precious_bytes: usize
     var tick: u64
     var guard: u64
     var hand: usize
@@ -52,10 +60,10 @@ pub struct TileCache:
         let entries = try alloc CacheEntry[capacity] in memory.heap
         errdefer free(entries) in memory.heap
         for index in 0..<capacity:
-            entries[index] = CacheEntry(key = 0, texture = gpu.Texture(), bytes = 0, used = 0, recent = false, live = false)
+            entries[index] = CacheEntry(key = 0, texture = gpu.Texture(), bytes = 0, used = 0, recent = false, live = false, precious = false)
         var map = try KeyMap.create(capacity)
         errdefer map.destroy()
-        return TileCache(entries = entries, map = map, budget = budget, held_bytes = 0, tick = 1, guard = 1, hand = 0, misses = 0, hits = 0)
+        return TileCache(entries = entries, map = map, budget = budget, held_bytes = 0, precious_bytes = 0, tick = 1, guard = 1, hand = 0, misses = 0, hits = 0)
 
     ## Begin a request: what it uses from now on stays until the next `hold`.
     pub mutating func hold():
@@ -76,8 +84,9 @@ pub struct TileCache:
 
     ## Keep `texture` (this takes it over) for `key`, making room as needed.
     ## Not `recent`, it is the first to go once its request is done: a tile
-    ## made only on the way to another (a pyramid's finer levels).
-    pub mutating func put(key: u64, texture: gpu.Texture, bytes: usize, recent: bool = true) -> !:
+    ## made only on the way to another (a pyramid's finer levels). A `precious`
+    ## one goes only after every other tile.
+    pub mutating func put(key: u64, texture: gpu.Texture, bytes: usize, recent: bool = true, precious: bool = false) -> !:
         self.misses += 1
         if let existing = self.map.find(key):
             self.drop((usize)existing)
@@ -86,25 +95,37 @@ pub struct TileCache:
             # Every entry is held: grow rather than fail.
             try self.grow()
         let at = self.free_slot() else trap("a grown cache has room")
-        self.entries[at] = CacheEntry(key = key, texture = texture, bytes = bytes, used = self.tick, recent = recent, live = true)
+        self.entries[at] = CacheEntry(key = key, texture = texture, bytes = bytes, used = self.tick, recent = recent, live = true, precious = precious)
+        if precious:
+            self.precious_bytes += bytes
         try self.map.put(key, (u32)at)
         self.held_bytes += bytes
         residency_derived(bytes, true)
 
-    ## Drop entries (unheld, least recently wanted first) until `bytes` more fit.
+    ## Drop entries (unheld, least recently wanted first) until `bytes` more
+    ## fit: every ordinary tile before any precious one, and precious tiles only
+    ## while they alone are over the budget. Each sweep is bounded: at most two
+    ## turns of the clock.
     mutating func make_room(bytes: usize):
-        var passes: usize = 0
         let limit = self.limit()
+        self.sweep(bytes, limit, false)
+        if self.held_bytes + bytes > limit and self.precious_bytes + bytes > limit:
+            self.sweep(bytes, limit, true)
+
+    mutating func sweep(bytes: usize, limit: usize, precious: bool):
+        var passes: usize = 0
         while self.held_bytes + bytes > limit and passes < self.entries.length * 2:
             let at = self.hand
             self.hand = (self.hand + 1) % self.entries.length
             passes += 1
-            if not self.entries[at].live or self.entries[at].used >= self.guard:
+            if not self.entries[at].live or self.entries[at].used >= self.guard or self.entries[at].precious != precious:
                 continue
             if self.entries[at].recent:
                 self.entries[at].recent = false
                 continue
             self.drop(at)
+            if precious and self.precious_bytes + bytes <= limit:
+                return
 
     func free_slot() -> usize?:
         for offset in 0..<self.entries.length:
@@ -120,7 +141,7 @@ pub struct TileCache:
         var map = try KeyMap.create(capacity)
         errdefer map.destroy()
         for index in 0..<capacity:
-            entries[index] = CacheEntry(key = 0, texture = gpu.Texture(), bytes = 0, used = 0, recent = false, live = false)
+            entries[index] = CacheEntry(key = 0, texture = gpu.Texture(), bytes = 0, used = 0, recent = false, live = false, precious = false)
         for index in 0..<self.entries.length:
             entries[index] = self.entries[index]
             if entries[index].live:
@@ -136,6 +157,8 @@ pub struct TileCache:
         self.map.remove(self.entries[at].key)
         self.entries[at].texture.destroy()
         self.held_bytes -= self.entries[at].bytes
+        if self.entries[at].precious:
+            self.precious_bytes -= self.entries[at].bytes
         residency_derived(self.entries[at].bytes, false)
         self.entries[at].live = false
 
@@ -215,3 +238,25 @@ test "a tile kept as not recent goes before the tiles a request wanted":
     try cache.put(6, try gpu.Texture.create(device, 16, 16, gpu.Format.rgba8_linear), 1024)
     assert(cache.bytes() == 4096)
     assert(cache.find(1) != none and cache.find(3) != none and cache.find(2) == none and cache.find(4) == none)
+
+test "precious tiles go only after every other one, and only while they alone are too many":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    # Room for four 1 KiB tiles: two precious, then ordinary ones pushing in.
+    var cache = try TileCache.create(4096, 1024)
+    defer cache.destroy()
+    cache.hold()
+    try cache.put(1, try gpu.Texture.create(device, 16, 16, gpu.Format.rgba8_linear), 1024, precious = true)
+    try cache.put(2, try gpu.Texture.create(device, 16, 16, gpu.Format.rgba8_linear), 1024, precious = true)
+    for key in 3..<(u64)10:
+        cache.hold()
+        try cache.put(key, try gpu.Texture.create(device, 16, 16, gpu.Format.rgba8_linear), 1024)
+    assert(cache.bytes() <= 4096 and cache.find(1) != none and cache.find(2) != none)
+    # Precious tiles alone past the budget: the least wanted of them go.
+    for key in 20..<(u64)26:
+        cache.hold()
+        try cache.put(key, try gpu.Texture.create(device, 16, 16, gpu.Format.rgba8_linear), 1024, precious = true)
+    cache.hold()
+    assert(cache.bytes() <= 4096)

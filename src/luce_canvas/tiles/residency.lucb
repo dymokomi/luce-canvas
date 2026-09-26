@@ -34,7 +34,7 @@ var last_tile: Tile*? = none
 func make_tile(texture: gpu.Texture) -> Tile*!:
     var no_ram: u8[]
     let tile = try new Tile(texture = texture, on_gpu = true, ram = no_ram, references = 1, stamp = next_stamp(), used = residency_epoch, live = 0,
-                            previous = last_tile, next = none) in memory.heap
+                            disk = -1, previous = last_tile, next = none) in memory.heap
     if let last = last_tile:
         last.next = tile
     else:
@@ -49,6 +49,7 @@ func make_tile(texture: gpu.Texture) -> Tile*!:
 func forget_tile(tile: Tile*):
     drop_gpu_copy(tile)
     drop_ram_copy(tile)
+    release_disk(tile)
     if let previous = tile.previous:
         previous.next = tile.next
     else:
@@ -89,6 +90,7 @@ func pass_texture(tile: Tile*, device: gpu.Device) -> gpu.Texture!:
     if tile.on_gpu:
         tile.used = residency_epoch
         return tile.texture
+    try ensure_ram(tile)
     var texture = try tile_texture(device)
     errdefer texture.destroy()
     try texture.upload(tile.ram)
@@ -128,6 +130,7 @@ func resident(tile: Tile*, device: gpu.Device) -> gpu.Texture!:
     tile.used = residency_epoch
     if tile.on_gpu:
         return tile.texture
+    try ensure_ram(tile)
     var texture = try tile_texture(device)
     errdefer texture.destroy()
     try texture.upload(tile.ram)

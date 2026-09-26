@@ -12,7 +12,10 @@
 #       made from (at level 0, their stamps), so painting a tile changes the keys of just
 #       the chain above it, and undo brings the old keys, and often the old tiles, back.
 #       They live in a TileCache, are dropped when space is short, and are made again when
-#       asked for — at most one downsample per level for each tile that changed.
+#       asked for — at most one downsample per level for each tile that changed. A store's
+#       coarsest levels are precious (`precious_level`): few, and each made from everything
+#       under it, so they go last. Keeping them bounds what a change costs to show when zoomed
+#       out: the chain above a changed tile, and the finer siblings of that chain.
 #
 #==============================================================================================
 
@@ -110,7 +113,7 @@ pub struct Pyramid:
         # A quarter with nothing finer is empty: clear to what empty means.
         discard(try frame.value().present(gpu.Color(1.0, 1.0, 1.0, 1.0) if mask else gpu.Color(0.0, 0.0, 0.0, 0.0)))
         self.renders += 1
-        try self.cache.put(key, texture, tile_bytes, recent = wanted)
+        try self.cache.put(key, texture, tile_bytes, recent = wanted, precious = precious_level(tiles.width(), tiles.height(), level))
         return texture
 
     ## What the level tiles keep, in bytes.
@@ -128,6 +131,20 @@ pub struct Pyramid:
         self.cache.destroy()
         self.pipeline.destroy()
         self.shader.destroy()
+
+## How many of a store's coarsest levels are precious: a level-L tile covers
+## 4^L tiles below it, so the top ones are few and each costly to make again.
+let precious_levels: u32 = 4
+
+## Whether `level` is one of the coarsest levels of a `width` by `height`
+## store: those at or above the level where the store fits one tile, less
+## `precious_levels` - 1. At 15000 by 24000 that is levels 4 and up, about a
+## hundred tiles a layer.
+pub func precious_level(width: u32, height: u32, level: u32) -> bool:
+    var top: u32 = 0
+    while top < 16 and ((u64)width > ((u64)tile_size << top) or (u64)height > ((u64)tile_size << top)):
+        top += 1
+    return level + precious_levels > top
 
 ## Whether cell (`column`, `row`) at `level` lies on the store.
 pub func cell_exists(tiles: const Tiles*, column: u32, row: u32, level: u32) -> bool:

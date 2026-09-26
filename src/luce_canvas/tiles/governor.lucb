@@ -11,9 +11,13 @@
 #       GPU is short.
 #
 #       Pins: every tile handed out (`resident`) carries the epoch it was handed out in, and
-#       nothing handed out in the current epoch is evicted. The editor `advance`s the epoch
-#       as a frame begins, when nothing from the frame before is still being recorded, and
-#       `settle`s at its end.
+#       nothing handed out in the current epoch is evicted. An epoch is a frame: a window's
+#       frame may draw the document several times (the view, the Navigator, a popup's
+#       backdrop), and every draw into it must find what the others recorded still there,
+#       since the frame is only submitted when it presents. So the epoch advances, and the
+#       governor settles, only at the first draw into a new frame, and never while another
+#       frame records around it (`residency_frame`). Evicting then touches only what frames
+#       already presented used, which the backends keep alive until the GPU is done.
 #
 #       Eviction takes the least wanted first:
 #         1. tiles no document shows: history's, and jobs' copies (known exactly after the
@@ -24,9 +28,11 @@
 #       coming back, bring it to the GPU again. Only when the GPU is out of memory and no
 #       tile can move does allocating fail.
 #
-#       Not yet: compressed RAM and a scratch disk (the design's C and D tiers). RAM-only
-#       tiles beyond the RAM budget stay where they are; the history budget (Settings ›
-#       Undo memory) is what bounds them.
+#       RAM has its budget too: past it, warm copies of tiles still on the GPU go first, then
+#       the least wanted tiles kept only in RAM (history's first) move to the scratch file
+#       (tiles/scratch), from which they come back when wanted. On unified memory (Apple
+#       silicon, an integrated GPU) the GPU's tiles are RAM as well, and count against it.
+#       Not yet: compressed RAM (the design's C tier).
 #
 #==============================================================================================
 
@@ -54,6 +60,9 @@ var residency_failures: usize = 0
 ## Epochs a tile counts as recently drawn for.
 let recent_epochs: u64 = 2
 
+## The frame the current epoch belongs to.
+var epoch_frame: u64 = 0
+
 ## What the tiers hold and may hold, in bytes.
 pub struct ResidencyReport:
     pub var gpu_tiles: usize
@@ -64,6 +73,10 @@ pub struct ResidencyReport:
     pub var promotions: u64
     pub var demotions: u64
     pub var transient_uploads: u64
+    ## Tiles in the scratch file, and moves out to it and back.
+    pub var disk_tiles: usize
+    pub var spills: u64
+    pub var loads: u64
 
 # mark: The governor's controls (one set per process; tiles live on the main thread) ==========
 
@@ -84,14 +97,33 @@ pub func residency_budgets(gpu_bytes: usize, ram_bytes: usize):
     gpu_budget = gpu_bytes
     ram_budget = ram_bytes
 
-## Begin a new epoch: what earlier ones pinned may move again.
+## Begin a new epoch: what earlier ones pinned may move again. For work
+## outside frames (headless steps, tests); a view calls `residency_frame`.
 pub func residency_advance():
     residency_epoch += 1
+
+## A draw into frame `serial`: the first draw into a new frame begins a new
+## epoch, unless another frame is recording around this one (a texture's frame
+## inside a window's), whose draws must keep what they pinned. True when an
+## epoch began: the moment to settle.
+pub func residency_frame(serial: u64) -> bool:
+    if serial == epoch_frame or gpu.open_frames() > 1:
+        return false
+    epoch_frame = serial
+    residency_epoch += 1
+    return true
 
 ## Whether the GPU tiers hold more than their budget: then the editor marks
 ## what its documents show and settles.
 pub func residency_over_budget() -> bool:
-    return (gpu_budget > 0 and gpu_tile_bytes + derived_tile_bytes > gpu_budget) or (ram_budget > 0 and ram_tile_bytes > ram_budget)
+    return (gpu_budget > 0 and gpu_tile_bytes + derived_tile_bytes > gpu_budget) or (ram_budget > 0 and ram_held() > ram_budget)
+
+## What counts against the RAM budget: RAM copies, and on unified memory the
+## GPU's tiles too.
+func ram_held() -> usize:
+    if unified_memory:
+        return ram_tile_bytes + gpu_tile_bytes + derived_tile_bytes
+    return ram_tile_bytes
 
 ## Begin marking what documents show: tiles not marked before `settle` are
 ## the first to leave the GPU.
@@ -120,8 +152,11 @@ pub func residency_settle(device: gpu.Device) -> !:
                 cache_scale_now = max_f64(0.25, cache_scale_now * 0.5)
         elif held < gpu_budget // 10 * 6:
             cache_scale_now = min_f64(1.0, cache_scale_now * 1.25)
-    if ram_budget > 0 and ram_tile_bytes > ram_budget:
-        drop_warm_copies(ram_tile_bytes - ram_budget)
+    if ram_budget > 0 and ram_held() > ram_budget:
+        let target = ram_budget // 100 * 85
+        drop_warm_copies(ram_held() - target)
+        if ram_held() > target:
+            try spill_ram(ram_held() - target)
 
 ## The share of their budgets derived caches may keep now.
 pub func residency_cache_scale() -> f64:
@@ -140,7 +175,8 @@ pub func residency_fail_allocations(count: usize):
 
 pub func residency_report() -> ResidencyReport:
     return ResidencyReport(gpu_tiles = gpu_tile_bytes, ram_tiles = ram_tile_bytes, derived = derived_tile_bytes, gpu_budget = gpu_budget, ram_budget = ram_budget,
-                           promotions = residency_promotions, demotions = residency_demotions, transient_uploads = residency_transient_uploads)
+                           promotions = residency_promotions, demotions = residency_demotions, transient_uploads = residency_transient_uploads,
+                           disk_tiles = disk_tile_bytes, spills = residency_spills, loads = residency_loads)
 
 ## The device is out of memory: shrink derived caches and move unpinned tiles
 ## to RAM, `wanted` bytes' worth, least wanted first. Bytes freed.
@@ -233,6 +269,36 @@ func sift_down(items: Candidate[], first: usize, count: usize):
         items[root] = items[child]
         items[child] = swapped
         root = child
+
+## Move RAM-only tiles to the scratch file, the least wanted first (history's
+## before a document's, then the least recently used), until `wanted` bytes of
+## RAM are free or none is left. Bytes freed.
+func spill_ram(wanted: usize) -> usize!:
+    var count: usize = 0
+    var cursor = first_tile
+    while let tile = cursor:
+        if not tile.on_gpu and tile.ram.length > 0 and tile.used != residency_epoch:
+            count += 1
+        cursor = tile.next
+    if count == 0:
+        return 0
+    let candidates = try alloc Candidate[count] in memory.heap
+    defer free(candidates) in memory.heap
+    var at: usize = 0
+    cursor = first_tile
+    while let tile = cursor:
+        if not tile.on_gpu and tile.ram.length > 0 and tile.used != residency_epoch and at < count:
+            candidates[at] = Candidate(tile = tile, key = eviction_key(tile))
+            at += 1
+        cursor = tile.next
+    sort_candidates(candidates[..<at])
+    var freed: usize = 0
+    for index in 0..<at:
+        if freed >= wanted:
+            break
+        try spill(candidates[index].tile)
+        freed += tile_bytes
+    return freed
 
 ## Free RAM copies of tiles that are also on the GPU, the least recently used
 ## first, until `wanted` bytes are gone or none is left.

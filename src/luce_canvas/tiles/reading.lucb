@@ -101,6 +101,9 @@ func fill_cell_batch(tiles: const Tiles*, cells: const Cell[], target: CellBatch
         target.sources[at - next] = none
         if let tile = tiles.tile(cell.column, cell.row):
             target.sources[at - next] = tile
+            if not tile.on_gpu:
+                # Neither on the GPU nor in RAM: its slot in the scratch file.
+                try ensure_ram(tile)
             if tile.ram.length > 0:
                 target.offsets[at - next] = ram_cell
             else:

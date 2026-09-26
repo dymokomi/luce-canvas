@@ -202,3 +202,117 @@ test "a tile drawn into in place lets its warm RAM copy go, so reads see the new
     assert(second[inside] == 0.0 and second[inside + 3] == 0.5)
     # The other cells still read as before.
     assert(second[(10 * 1024 + 10) * 4] == first[(10 * 1024 + 10) * 4])
+
+test "past the RAM budget tiles go to the scratch file and read back the same":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    defer residency_budgets(0, 0)
+    var tiles = try distinct_layer(device, 0.5)
+    defer tiles.destroy()
+    let before = try read_all(&tiles)
+    defer free(before) in memory.heap
+    # One tile's worth of GPU and two of RAM: settling moves the rest down twice.
+    residency_budgets(tile_bytes, tile_bytes * 2)
+    residency_advance()
+    let spilled = residency_report().spills
+    try residency_settle(device)
+    assert(ram_tile_bytes <= tile_bytes * 2 and residency_report().spills > spilled and disk_tile_bytes > 0)
+    # Reads bring disk tiles back through RAM, identical.
+    let after = try read_all(&tiles)
+    defer free(after) in memory.heap
+    assert(same_samples(before, after) and residency_report().loads > 0)
+    # Settling again keeps RAM in its budget; slots are kept, so nothing is written again.
+    residency_advance()
+    let written = disk_tile_bytes
+    try residency_settle(device)
+    assert(ram_tile_bytes <= tile_bytes * 2 and disk_tile_bytes == written)
+    # A tile drawn with comes back to the GPU from its slot.
+    let texture = (try tiles.texture(3, 1)) else trap("a painted cell")
+    var texel: u8[8]
+    try texture.read(texel, gpu.Region(5, 7, 1, 1))
+    let green = from_half((u16)texel[2] | ((u16)texel[3] << 8))
+    assert(green == from_half(to_half(before[((256 + 7) * 1024 + 768 + 5) * 4 + 1])))
+
+test "the tiles' slots are freed with them and used again":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    defer residency_budgets(0, 0)
+    residency_budgets(tile_bytes, tile_bytes)
+    var first = try distinct_layer(device, 0.1)
+    residency_advance()
+    try residency_settle(device)
+    let held = disk_tile_bytes
+    assert(held > 0)
+    first.destroy()
+    assert(disk_tile_bytes == held - held)
+    let end = scratch_end
+    var second = try distinct_layer(device, 0.9)
+    defer second.destroy()
+    residency_advance()
+    try residency_settle(device)
+    # The second layer fits in the slots the first gave back.
+    assert(scratch_end == end and disk_tile_bytes > 0)
+
+test "an epoch lasts a frame: draws into one frame share it, and a frame inside another leaves it":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    var outer_texture = try gpu.Texture.create(device, 8, 8, gpu.Format.rgba8_linear)
+    defer outer_texture.destroy()
+    var inner_texture = try gpu.Texture.create(device, 8, 8, gpu.Format.rgba8_linear)
+    defer inner_texture.destroy()
+    let before = residency_epoch
+    let outer = try outer_texture.frame()
+    let target = try outer.value().target()
+    let serial = target.value().frame_serial()
+    assert(residency_frame(serial) and residency_epoch == before + 1)
+    assert(not residency_frame(serial) and residency_epoch == before + 1)
+    let inner = try inner_texture.frame()
+    let inner_target = try inner.value().target()
+    assert(not residency_frame(inner_target.value().frame_serial()) and residency_epoch == before + 1)
+    inner_target.release()
+    discard(try inner.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
+    inner.release()
+    target.release()
+    discard(try outer.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
+    outer.release()
+    let next = try outer_texture.frame()
+    let next_target = try next.value().target()
+    assert(residency_frame(next_target.value().frame_serial()) and residency_epoch == before + 2)
+    next_target.release()
+    discard(try next.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
+    next.release()
+
+test "a tile from the scratch file drawn into in place lets its slot go, so it never reloads the old pixels":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    defer residency_budgets(0, 0)
+    var tiles = try distinct_layer(device, 0.5)
+    defer tiles.destroy()
+    # Down to the scratch file, then back to the GPU to be drawn into.
+    residency_budgets(tile_bytes, tile_bytes)
+    residency_advance()
+    try residency_settle(device)
+    let texture = (try tiles.texture(2, 0)) else trap("a painted cell")
+    let tile = tiles.tile(2, 0) else trap("a painted cell")
+    assert(tile.disk >= 0)
+    let texels = try alloc u8[(usize)tile_size * (usize)tile_size * 8] in memory.heap
+    defer free(texels) in memory.heap
+    for index in 0..<texels.length:
+        texels[index] = 0
+    try texture.upload(texels)
+    try tiles.redrawn(2, 0)
+    assert(tile.disk < 0 and tile.ram.length == 0)
+    # Moved down again and read, it is the new content: clear.
+    residency_advance()
+    try residency_settle(device)
+    let after = try read_all(&tiles)
+    defer free(after) in memory.heap
+    assert(after[((10 * 1024) + 512 + 10) * 4 + 3] == 0.0)

@@ -7,9 +7,11 @@
 ## (linear light). A tile lives on the GPU, in RAM, or both (tiles/residency):
 ## `texture` brings it to the GPU when it is wanted there.
 import c
+import files
 import gpu
 import memory
 import os
+import paths
 import platform
 import thread
 from luce_canvas.half import to_half, from_half
@@ -35,6 +37,8 @@ pub struct Tile:
     ## The marking generation that last found it in a document (not only in
     ## history or a job's copy).
     var live: u64
+    ## Its slot in the scratch file (tiles/scratch), or -1 when it has none.
+    var disk: i64
     ## Every tile, in the order made: what the governor walks.
     var previous: Tile*?
     var next: Tile*?
@@ -227,8 +231,8 @@ pub struct Tiles:
         return tile.references == 1
 
     ## The cell's tile, held here alone, was drawn into again on the GPU: a new
-    ## stamp, and a RAM copy of what it held before is let go, so a read never
-    ## serves the old pixels.
+    ## stamp, and the RAM copy and scratch slot of what it held before are let
+    ## go, so a read or a reload never serves the old pixels.
     pub mutating func redrawn(column: u32, row: u32) -> !:
         let tile = self.tile(column, row) else error(invalid, "no tile to redraw")
         if tile.references != 1:
@@ -236,6 +240,7 @@ pub struct Tiles:
         tile.stamp = next_stamp()
         if tile.on_gpu:
             drop_ram_copy(tile)
+            release_disk(tile)
 
     ## Make a cell transparent again.
     pub mutating func clear(column: u32, row: u32) -> !:

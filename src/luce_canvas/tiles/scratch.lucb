@@ -1,0 +1,123 @@
+#==============================================================================================
+#
+#   tiles/scratch - The disk tier: tiles past the RAM budget, in a scratch file
+#
+#   DESCRIPTION:
+#       When the RAM copies of tiles outgrow the RAM budget, the governor moves the least
+#       wanted of those not on the GPU (history's first) to one scratch file: each tile is a
+#       slot of `tile_bytes` at a slot-aligned offset, written once (a tile never changes)
+#       and read back when the tile is wanted again, which leaves the slot in place so moving
+#       it out once more costs nothing. A slot freed with its tile goes on a free list and is
+#       used again before the file grows. The file is made the first time it is needed, in a
+#       fresh directory under the system's temporary one; on macOS and Linux its name is
+#       removed at once, so nothing is left behind whatever way the process ends.
+#
+#==============================================================================================
+
+## The scratch file, once made; its next unused offset; slots given back.
+var scratch: files.File*? = none
+var scratch_end: i64 = 0
+var free_slots: i64[]
+var free_count: usize = 0
+## Bytes of tiles held in slots, and tiles written out and read back.
+var disk_tile_bytes: usize = 0
+var residency_spills: u64 = 0
+var residency_loads: u64 = 0
+
+## The directory temporary files go in: TMPDIR or TEMP, else /tmp.
+func temporary_root() -> str:
+    if let chosen = os.env((c.str)"TMPDIR"):
+        return chosen
+    if let chosen = os.env((c.str)"TEMP"):
+        return chosen
+    return "/tmp"
+
+## The scratch file, made on first use.
+func scratch_file() -> files.File*!:
+    if let open = scratch:
+        return open
+    let directory = try files.create_temporary_directory((c.str)temporary_root())
+    let path = try paths.join(directory, "tiles.scratch")
+    var opened = try files.File.open((c.str)path, files.OpenMode.create_new_read_write, permissions = 384)
+    errdefer opened.destroy()
+    let kept = try new files.File in memory.heap
+    *kept = opened
+    scratch = kept
+    if not platform.windows:
+        # The open file lives on without a name; nothing is left behind.
+        files.remove_file((c.str)path) catch failure:
+            discard(failure)
+        files.remove_directory((c.str)directory) catch failure:
+            discard(failure)
+    return kept
+
+## A slot for one tile: a freed one, else the end of the file.
+func take_slot() -> i64!:
+    if free_count > 0:
+        free_count -= 1
+        return free_slots[free_count]
+    let offset = scratch_end
+    scratch_end += (i64)tile_bytes
+    return offset
+
+func give_slot(offset: i64) -> !:
+    if free_count == free_slots.length:
+        let grown = try alloc i64[free_slots.length * 2 + 64] in memory.heap
+        memory.copy(grown, free_slots, free_count)
+        if free_slots.length > 0:
+            free(free_slots) in memory.heap
+        free_slots = grown
+    free_slots[free_count] = offset
+    free_count += 1
+
+## Move `tile`'s RAM copy to the scratch file (writing it only the first time)
+## and free the RAM. A tile on the GPU keeps its texture.
+func spill(tile: Tile*) -> !:
+    if tile.ram.length == 0:
+        return
+    if tile.disk < 0:
+        let file = try scratch_file()
+        let offset = try take_slot()
+        errdefer try_give_slot(offset)
+        discard(try file.seek(offset))
+        var written: usize = 0
+        while written < tile_bytes:
+            let count = try file.write(tile.ram[written..])
+            if count == 0:
+                error(invalid, "the scratch file took no more bytes")
+            written += count
+        tile.disk = offset
+        disk_tile_bytes += tile_bytes
+    drop_ram_copy(tile)
+    residency_spills += 1
+
+func try_give_slot(offset: i64):
+    give_slot(offset) catch failure:
+        discard(failure)
+
+## Bring `tile`'s bytes back into RAM from its slot, if they are only on disk;
+## the slot stays, so spilling it again is free.
+func ensure_ram(tile: Tile*) -> !:
+    if tile.ram.length > 0 or tile.disk < 0:
+        return
+    let file = try scratch_file()
+    let copy = try alloc u8[tile_bytes] in memory.heap
+    errdefer free(copy) in memory.heap
+    discard(try file.seek(tile.disk))
+    var read: usize = 0
+    while read < tile_bytes:
+        let count = try file.read(copy[read..])
+        if count == 0:
+            error(invalid, "the scratch file ended inside a tile")
+        read += count
+    tile.ram = copy
+    ram_tile_bytes += tile_bytes
+    residency_loads += 1
+
+## Free `tile`'s slot: the tile is gone.
+func release_disk(tile: Tile*):
+    if tile.disk < 0:
+        return
+    try_give_slot(tile.disk)
+    tile.disk = -1
+    disk_tile_bytes -= tile_bytes
