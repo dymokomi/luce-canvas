@@ -37,7 +37,7 @@ def package "luce-canvas" {
 
     def dependency "luce-std" {
         str owner = "dymokomi"
-        str version = "^0.1.1"
+        str version = "^0.1.3"
         str path = "../luce-std"
     }
 }
