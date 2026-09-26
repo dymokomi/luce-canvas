@@ -1,7 +1,7 @@
 #prisma 4.0
 def package "luce-canvas" {
     str owner = "dymokomi"
-    str version = "0.1.12"
+    str version = "0.1.13"
     str kind = "package"
     str language = "luce-base"
     str description = "The canvas engine for Luce image editors: documents as immutable, shared 256-pixel GPU tiles, built to keep very large canvases fast."
