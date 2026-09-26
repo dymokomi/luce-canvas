@@ -165,8 +165,13 @@ pub func residency_settle(device: gpu.Device) -> !:
             # Derived caches shrink only when layer tiles moving to RAM is not enough.
             if (try evict(device, wanted)) < wanted:
                 cache_scale_now = max_f64(0.25, cache_scale_now * 0.5)
-        elif held < gpu_budget // 10 * 6:
+        elif held < gpu_budget // 10 * 6 and derived_tile_bytes < gpu_budget // 4:
             cache_scale_now = min_f64(1.0, cache_scale_now * 1.25)
+        # Derived caches keep at most half the budget, so the layer tiles a frame or a job
+        # draws with have the rest. Tiles a document file backs leave for nothing, so moving
+        # layer tiles out alone would always suffice and hand the caches all of it.
+        if derived_tile_bytes > gpu_budget // 2:
+            cache_scale_now = max_f64(0.1, cache_scale_now * 0.5)
     if ram_budget > 0:
         let pressure = ram_pressure()
         if pressure > ram_budget:
