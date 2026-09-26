@@ -38,7 +38,10 @@ let ram_cell: usize = 0xfffffffffffffffe
 ## in the list's order. `bytes` are the cell's rgba16f texels, rows 256 texels
 ## (2048 bytes) apart, as many rows as the cell has; empty for a cell with no
 ## tile (transparent). They are valid only during the call. Main thread only.
-pub func read_cells(tiles: const Tiles*, cells: const Cell[], context: void*?, visit: func(void*?, Cell, const u8[]) -> unit!) -> !:
+## With `warm`, whole tiles read back from the GPU are kept in RAM too while
+## the governor has room (a later read is free); a one-pass reader (a save)
+## passes false, so it leaves memory as it found it.
+pub func read_cells(tiles: const Tiles*, cells: const Cell[], context: void*?, visit: func(void*?, Cell, const u8[]) -> unit!, warm: bool = true) -> !:
     if cells.length == 0:
         return
     let device = tiles.device()
@@ -77,7 +80,7 @@ pub func read_cells(tiles: const Tiles*, cells: const Cell[], context: void*?, v
             let bytes = try current.batch.bytes(offset, length)
             # A whole tile read anyway is kept in RAM too while there is room.
             if let source = current.sources[index - current.first]:
-                if rows == (usize)tile_size:
+                if warm and rows == (usize)tile_size:
                     keep_warm(source, bytes)
             try visit(context, cell, bytes)
         current.pending = false
@@ -95,6 +98,7 @@ func fill_cell_batch(tiles: const Tiles*, cells: const Cell[], target: CellBatch
     try target.batch.reset()
     target.first = next
     target.submitted = false
+    try fetch_batch(tiles, cells, next, target.offsets.length)
     var at = next
     while at < cells.length and at - next < target.offsets.length:
         let cell = cells[at]
@@ -120,6 +124,25 @@ func fill_cell_batch(tiles: const Tiles*, cells: const Cell[], target: CellBatch
         try target.batch.submit()
         target.submitted = true
     return at
+
+## The backed tiles among the next `most` cells from `next` that have no copy
+## anywhere, read in from their document file together (decoded across the
+## processors) rather than one by one as the batch is filled.
+func fetch_batch(tiles: const Tiles*, cells: const Cell[], next: usize, most: usize) -> !:
+    let last = min_usize(cells.length, next + most)
+    var wanted: Tile*[64] = ---
+    var count: usize = 0
+    for index in next..<last:
+        let tile = tiles.tile(cells[index].column, cells[index].row) else continue
+        if tile.on_gpu or tile.ram.length > 0 or tile.disk >= 0 or not backed(tile):
+            continue
+        wanted[count] = tile
+        count += 1
+        if count == 64:
+            try fetch_many(wanted[..<count])
+            count = 0
+    if count > 0:
+        try fetch_many(wanted[..<count])
 
 func release_cell_batch(target: CellBatch*):
     target.batch.finish()

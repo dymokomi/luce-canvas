@@ -1,0 +1,203 @@
+#==============================================================================================
+#
+#   tiles/backing - Tiles whose bytes also live in a document file
+#
+#   DESCRIPTION:
+#       A tile loaded from (or just saved to) a document file keeps where it lies there: the
+#       file (a `TileSource`, open for as long as any tile or its opener holds it), the
+#       record's offset and length, and how many texel rows it holds. Such a tile never needs
+#       the scratch file: the governor drops its texture or its RAM copy outright, since the
+#       file still has it, and a tile wanted again is read and decoded from the file (the
+#       application's `decode` undoes whatever the format stores: filters, compression).
+#       Drawing into a tile in place (`Tiles.redrawn`) lets its backing go, as the file no
+#       longer holds what it shows.
+#
+#==============================================================================================
+
+## Undo a stored record: `packed` into `into` (a whole tile's rgba16f bytes,
+## zeroed beforehand), `rows` texel rows of it. Runs on worker threads too.
+pub type TileDecode = func(void*?, const u8[], u32, u8[]) -> unit!
+
+## An open document file tiles are backed by.
+pub struct TileSource:
+    var file: files.File
+    ## The opener's hold plus one per backed tile; the file closes at zero.
+    var references: usize
+    var context: void*?
+    var decode: TileDecode
+    ## Where the file is, to know a save over it.
+    var path: str
+
+## Open `path` as a source of tiles decoded by `decode` (with `context`). The
+## caller holds one reference and lets it go with `release_tile_source`.
+pub func open_tile_source(path: str, context: void*?, decode: TileDecode) -> TileSource*!:
+    let native = try strings.copy(path)
+    errdefer strings.release(native)
+    var file = try files.File.open((c.str)native)
+    errdefer file.destroy()
+    return try new TileSource(file = file, references = 1, context = context, decode = decode, path = native) in memory.heap
+
+## Let go of one hold on `source`; the last closes the file.
+pub func release_tile_source(source: TileSource*):
+    source.references -= 1
+    if source.references > 0:
+        return
+    source.file.destroy()
+    strings.release(source.path)
+    free(source) in memory.heap
+
+## Whether `source` is the file at `path`.
+pub func tile_source_is(source: const TileSource*, path: str) -> bool:
+    return source.path == path
+
+## Back the tile at cell (`column`, `row`) of `tiles` by the record at `offset`
+## (`length` bytes, `rows` texel rows) of `source`; a backing it had goes.
+pub func back_cell(tiles: const Tiles*, column: u32, row: u32, source: TileSource*, offset: u64, length: u32, rows: u32) -> !:
+    let tile = tiles.tile(column, row) else error(invalid, "no tile to back")
+    back_tile(tile, source, offset, length, rows)
+
+func back_tile(tile: Tile*, source: TileSource*, offset: u64, length: u32, rows: u32):
+    source.references += 1
+    release_backing(tile)
+    tile.source = source
+    tile.source_offset = offset
+    tile.source_length = length
+    tile.source_rows = rows
+
+## Let `tile`'s backing go (it is being freed, or its pixels changed).
+func release_backing(tile: Tile*):
+    let source = tile.source else return
+    tile.source = none
+    release_tile_source(source)
+
+## Whether the tile's bytes can come back from a document file.
+func backed(tile: const Tile*) -> bool:
+    return tile.source != none
+
+## Bring a backed tile's bytes into RAM from its file.
+func fetch_backed(tile: Tile*) -> !:
+    let source = tile.source else return
+    let copy = try alloc u8[tile_bytes] in memory.heap
+    errdefer free(copy) in memory.heap
+    let packed = try alloc u8[(usize)tile.source_length] in memory.heap
+    defer free(packed) in memory.heap
+    try read_record(source, tile.source_offset, packed)
+    memory.set(copy, 0)
+    try source.decode(source.context, packed, tile.source_rows, copy)
+    tile.ram = copy
+    ram_tile_bytes += tile_bytes
+    residency_fetches += 1
+
+func read_record(source: TileSource*, offset: u64, into: u8[]) -> !:
+    discard(try source.file.seek((i64)offset))
+    var read: usize = 0
+    while read < into.length:
+        let count = try source.file.read(into[read..])
+        if count == 0:
+            error(invalid, "a document file ended inside a tile")
+        read += count
+
+## Bring every backed tile of `tiles` that has no copy anywhere into RAM: the
+## records read in order, then decoded across the processors (a read of many
+## cells would otherwise decode them one by one).
+func fetch_many(tiles: Tile*[]) -> !:
+    var jobs: FetchJob[] = none_jobs()
+    var count: usize = 0
+    for tile in tiles:
+        if tile.on_gpu or tile.ram.length > 0 or tile.disk >= 0 or tile.source == none:
+            continue
+        count += 1
+    if count == 0:
+        return
+    jobs = try alloc FetchJob[count] in memory.heap
+    defer release_jobs(jobs)
+    var at: usize = 0
+    for tile in tiles:
+        if tile.on_gpu or tile.ram.length > 0 or tile.disk >= 0 or tile.source == none:
+            continue
+        let source = tile.source else trap("backed")
+        var no_bytes: u8[]
+        jobs[at] = FetchJob(tile = tile, packed = no_bytes, copy = no_bytes, failed = false)
+        jobs[at].packed = try alloc u8[(usize)tile.source_length] in memory.heap
+        jobs[at].copy = try alloc u8[tile_bytes] in memory.heap
+        memory.set(jobs[at].copy, 0)
+        try read_record(source, tile.source_offset, jobs[at].packed)
+        at += 1
+    try spread_fetch(jobs[..<at])
+    for index in 0..<at:
+        if jobs[index].failed:
+            error(invalid, "a tile of a document file could not be decoded")
+    for index in 0..<at:
+        let tile = jobs[index].tile
+        tile.ram = jobs[index].copy
+        var taken: u8[]
+        jobs[index].copy = taken
+        ram_tile_bytes += tile_bytes
+        residency_fetches += 1
+
+## One tile's record and the bytes it decodes to.
+struct FetchJob:
+    var tile: Tile*
+    var packed: u8[]
+    var copy: u8[]
+    var failed: bool
+
+func none_jobs() -> FetchJob[]:
+    var nothing: FetchJob[]
+    return nothing
+
+func release_jobs(jobs: FetchJob[]):
+    for index in 0..<jobs.length:
+        if jobs[index].packed.length > 0:
+            free(jobs[index].packed) in memory.heap
+        if jobs[index].copy.length > 0:
+            free(jobs[index].copy) in memory.heap
+    free(jobs) in memory.heap
+
+## A share of the jobs for one worker.
+struct FetchShare:
+    var jobs: FetchJob[]
+
+func fetch_entry(context: void*?):
+    decode_jobs((FetchShare*)(context else return))
+
+func decode_jobs(share: FetchShare*):
+    for index in 0..<share.jobs.length:
+        let job = &share.jobs[index]
+        let source = job.tile.source else continue
+        source.decode(source.context, job.packed, job.tile.source_rows, job.copy) catch failure:
+            discard(failure)
+            job.failed = true
+
+## Decode `jobs` on up to 16 threads, this one included.
+func spread_fetch(jobs: FetchJob[]) -> !:
+    let workers = min_usize(16, min_usize(jobs.length, max_usize(1, (usize)os.cpus())))
+    var shares: FetchShare[16] = ---
+    let per = (jobs.length + workers - 1) // workers
+    for index in 0..<workers:
+        let first = min_usize(jobs.length, index * per)
+        shares[index] = FetchShare(jobs = jobs[first..<min_usize(jobs.length, first + per)])
+    var handles: thread.Handle[16]
+    var started: usize = 0
+    for index in 1..<workers:
+        handles[started] = thread.spawn(fetch_entry, (void*)&shares[index], name = "tiles-fetch") catch failure:
+            discard(failure)
+            decode_jobs(&shares[index])
+            continue
+        started += 1
+    decode_jobs(&shares[0])
+    for index in 0..<started:
+        try handles[index].join()
+
+## Before `source`'s file goes (a save over it): every tile backed by it
+## that `keep` does not re-home is brought into RAM and let go of its
+## backing, so nothing reads the file once it is closed.
+pub func detach_tile_source(source: TileSource*) -> !:
+    var cursor = first_tile
+    while let tile = cursor:
+        cursor = tile.next
+        if tile.source != source:
+            continue
+        if not tile.on_gpu and tile.ram.length == 0 and tile.disk < 0:
+            try fetch_backed(tile)
+        release_backing(tile)

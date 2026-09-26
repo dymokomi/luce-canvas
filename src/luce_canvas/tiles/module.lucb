@@ -40,6 +40,12 @@ pub struct Tile:
     var live: u64
     ## Its slot in the scratch file (tiles/scratch), or -1 when it has none.
     var disk: i64
+    ## The document file record that also holds it (tiles/backing), if any:
+    ## such a tile leaves the GPU and RAM without being written anywhere.
+    var source: TileSource*?
+    var source_offset: u64
+    var source_length: u32
+    var source_rows: u32
     ## Every tile, in the order made: what the governor walks.
     var previous: Tile*?
     var next: Tile*?
@@ -239,6 +245,8 @@ pub struct Tiles:
         if tile.references != 1:
             error(invalid, "a shared tile cannot be redrawn")
         tile.stamp = next_stamp()
+        # The file no longer holds what it shows.
+        release_backing(tile)
         if tile.on_gpu:
             drop_ram_copy(tile)
             release_disk(tile)
@@ -335,8 +343,8 @@ pub struct Tiles:
     ## Read `cells` back, calling `visit(context, cell, bytes)` for each in order
     ## (see `read_cells`): many cells per submission, the next batch on the GPU
     ## while the caller works through one.
-    pub func read_many(cells: const Cell[], context: void*?, visit: func(void*?, Cell, const u8[]) -> unit!) -> !:
-        try read_cells(&self, cells, context, visit)
+    pub func read_many(cells: const Cell[], context: void*?, visit: func(void*?, Cell, const u8[]) -> unit!, warm: bool = true) -> !:
+        try read_cells(&self, cells, context, visit, warm)
 
     ## Read every pixel back as straight-alpha RGBA f32 samples, top-down.
     pub func read(pixels: f32[]) -> !:

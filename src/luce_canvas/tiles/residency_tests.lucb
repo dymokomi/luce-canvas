@@ -325,3 +325,72 @@ test "the process's memory is told where the system can tell it, and never past 
     if machine > 0:
         assert((u64)held <= machine)
     assert(residency_report().process >= held // 2)
+
+## A test source's decode: its records are raw tile rows.
+func decode_raw(context: void*?, packed: const u8[], rows: u32, into: u8[]) -> !:
+    discard(context)
+    let bytes = (usize)rows * (usize)tile_size * 8
+    if packed.length < bytes:
+        error(invalid, "a raw record is short")
+    memory.copy(into, packed, bytes)
+
+## Where `write_raw`'s visitor puts each cell: the file and each cell's offset.
+struct RawSink:
+    var file: files.File*
+    var offsets: u64[]
+    var at: usize
+    var written: u64
+
+func write_raw(context: void*?, cell: Cell, bytes: const u8[]) -> !:
+    discard(cell)
+    let sink = (RawSink*)(context else return)
+    sink.offsets[sink.at] = sink.written
+    sink.at += 1
+    var done: usize = 0
+    while done < bytes.length:
+        done += try sink.file.write(bytes[done..])
+    sink.written += (u64)bytes.length
+
+test "tiles backed by a document file leave the GPU and RAM without being written, and come back the same":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    defer residency_budgets(0, 0)
+    var tiles = try distinct_layer(device, 0.75)
+    defer tiles.destroy()
+    let before = try read_all(&tiles)
+    defer free(before) in memory.heap
+    # The layer's cells, raw, in a file of their own.
+    let folder = try files.create_temporary_directory((c.str)temporary_root())
+    let path = try paths.join(folder, "backing.raw")
+    var file = try files.File.open((c.str)path, files.OpenMode.replace)
+    var cells: Cell[8] = ---
+    for index in 0..<(usize)8:
+        cells[index] = Cell(column = (u32)(index % 4), row = (u32)(index // 4))
+    var sink = RawSink(file = &file, offsets = try alloc u64[8] in memory.heap, at = 0, written = 0)
+    defer free(sink.offsets) in memory.heap
+    try read_cells(&tiles, cells, (void*)&sink, write_raw, warm = false)
+    try file.close()
+    let source = try open_tile_source(path, none, decode_raw)
+    for index in 0..<(usize)8:
+        try back_cell(&tiles, cells[index].column, cells[index].row, source, sink.offsets[index], (u32)tile_bytes, tile_size)
+    assert(source.references == 9)
+    # One tile's worth of GPU and of RAM: the rest leave both, and nothing is written.
+    residency_budgets(tile_bytes, tile_bytes)
+    residency_advance()
+    let disk_before = disk_tile_bytes
+    try residency_settle(device)
+    assert(gpu_count(&tiles) <= 1 and disk_tile_bytes == disk_before)
+    # Reads bring them back from the file, identical.
+    let fetched = residency_report().fetches
+    let after = try read_all(&tiles)
+    defer free(after) in memory.heap
+    assert(same_samples(before, after) and residency_report().fetches > fetched and disk_tile_bytes == disk_before)
+    # Drawn into in place, a tile lets its backing go: the file no longer holds it.
+    let drawn = tiles.tile(1, 0) else trap("a painted cell")
+    discard(try tiles.texture(1, 0))
+    try tiles.redrawn(1, 0)
+    assert(drawn.source == none and source.references == 8)
+    release_tile_source(source)
+    try files.remove_tree((c.str)folder)

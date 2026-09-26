@@ -81,6 +81,8 @@ pub struct ResidencyReport:
     pub var disk_tiles: usize
     pub var spills: u64
     pub var loads: u64
+    ## Tiles read back from a document file (tiles/backing).
+    pub var fetches: u64
     ## What the system says the process holds; 0 where it cannot tell.
     pub var process: usize
 
@@ -198,7 +200,7 @@ pub func residency_fail_allocations(count: usize):
 pub func residency_report() -> ResidencyReport:
     return ResidencyReport(gpu_tiles = gpu_tile_bytes, ram_tiles = ram_tile_bytes, derived = derived_tile_bytes, gpu_budget = gpu_budget, ram_budget = ram_budget,
                            promotions = residency_promotions, demotions = residency_demotions, transient_uploads = residency_transient_uploads,
-                           disk_tiles = disk_tile_bytes, spills = residency_spills, loads = residency_loads, process = process_memory())
+                           disk_tiles = disk_tile_bytes, spills = residency_spills, loads = residency_loads, fetches = residency_fetches, process = process_memory())
 
 ## The device is out of memory: shrink derived caches and move unpinned tiles
 ## to RAM, `wanted` bytes' worth, least wanted first. Bytes freed.

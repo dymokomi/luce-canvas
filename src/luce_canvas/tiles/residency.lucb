@@ -34,7 +34,7 @@ var last_tile: Tile*? = none
 func make_tile(texture: gpu.Texture) -> Tile*!:
     var no_ram: u8[]
     let tile = try new Tile(texture = texture, on_gpu = true, ram = no_ram, references = 1, stamp = next_stamp(), used = residency_epoch, live = 0,
-                            disk = -1, previous = last_tile, next = none) in memory.heap
+                            disk = -1, source = none, source_offset = 0, source_length = 0, source_rows = 0, previous = last_tile, next = none) in memory.heap
     if let last = last_tile:
         last.next = tile
     else:
@@ -50,6 +50,7 @@ func forget_tile(tile: Tile*):
     drop_gpu_copy(tile)
     drop_ram_copy(tile)
     release_disk(tile)
+    release_backing(tile)
     if let previous = tile.previous:
         previous.next = tile.next
     else:
@@ -202,7 +203,8 @@ func demote(device: gpu.Device, tiles: Tile*[]) -> usize!:
             at += 1
             if not tile.on_gpu or tile.used == residency_epoch:
                 continue
-            if tile.ram.length > 0:
+            # A copy in RAM, or in the document file: nothing to read back.
+            if tile.ram.length > 0 or backed(tile):
                 drop_gpu_copy(tile)
                 residency_demotions += 1
                 freed += tile_bytes

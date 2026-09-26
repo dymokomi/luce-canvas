@@ -29,6 +29,8 @@ var free_count: usize = 0
 var disk_tile_bytes: usize = 0
 var residency_spills: u64 = 0
 var residency_loads: u64 = 0
+## Tiles brought back from a document file (tiles/backing).
+var residency_fetches: u64 = 0
 
 ## The scratch directory the application chose; empty for the default.
 var chosen_root: str = ""
@@ -198,7 +200,8 @@ func give_slot(offset: i64) -> !:
 func spill(tile: Tile*) -> !:
     if tile.ram.length == 0:
         return
-    if tile.disk < 0:
+    # The document file holds it: nothing to write.
+    if tile.disk < 0 and not backed(tile):
         let file = try scratch_file()
         let offset = try take_slot()
         errdefer try_give_slot(offset)
@@ -221,7 +224,10 @@ func try_give_slot(offset: i64):
 ## Bring `tile`'s bytes back into RAM from its slot, if they are only on disk;
 ## the slot stays, so spilling it again is free.
 func ensure_ram(tile: Tile*) -> !:
-    if tile.ram.length > 0 or tile.disk < 0:
+    if tile.ram.length > 0:
+        return
+    if tile.disk < 0:
+        try fetch_backed(tile)
         return
     let file = try scratch_file()
     let copy = try alloc u8[tile_bytes] in memory.heap

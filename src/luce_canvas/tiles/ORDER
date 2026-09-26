@@ -2,6 +2,7 @@ module.lucb
 reading.lucb
 residency.lucb
 scratch.lucb
+backing.lucb
 governor.lucb
 residency_tests.lucb
 scratch_tests.lucb
