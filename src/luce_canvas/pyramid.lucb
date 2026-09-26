@@ -51,6 +51,13 @@ pub struct Pyramid:
     ## Cell (`column`, `row`) of `tiles` at `level`, borrowed until the next
     ## `hold`; none where nothing is (transparent, or for a `mask`, white).
     pub mutating func texture(tiles: const Tiles*, column: u32, row: u32, level: u32, mask: bool = false) -> gpu.Texture?!:
+        return try self.level_tile(tiles, column, row, level, mask, true)
+
+    ## `texture`, `wanted` for itself or only on the way to a coarser tile. A
+    ## tile made on the way is kept as least wanted, so building one coarse tile
+    ## (a level-4 tile makes 84 finer ones) does not push out the coarse tiles
+    ## every frame needs.
+    mutating func level_tile(tiles: const Tiles*, column: u32, row: u32, level: u32, mask: bool, wanted: bool) -> gpu.Texture?!:
         if level == 0:
             return tiles.texture(column, row)
         if level > 16:
@@ -68,7 +75,7 @@ pub struct Pyramid:
             let fine_column = column * 2 + (u32)(quarter % 2)
             let fine_row = row * 2 + (u32)(quarter // 2)
             if cell_exists(tiles, fine_column, fine_row, level - 1):
-                if let part = try self.texture(tiles, fine_column, fine_row, level - 1, mask):
+                if let part = try self.level_tile(tiles, fine_column, fine_row, level - 1, mask, false):
                     parts[quarter] = part
                     present[quarter] = true
                 covered[quarter * 2] = covered_at(tiles.width(), fine_column, level - 1)
@@ -91,7 +98,7 @@ pub struct Pyramid:
         # A quarter with nothing finer is empty: clear to what empty means.
         discard(try frame.value().present(gpu.Color(1.0, 1.0, 1.0, 1.0) if mask else gpu.Color(0.0, 0.0, 0.0, 0.0)))
         self.renders += 1
-        try self.cache.put(key, texture, tile_bytes)
+        try self.cache.put(key, texture, tile_bytes, recent = wanted)
         return texture
 
     ## What the level tiles keep, in bytes.

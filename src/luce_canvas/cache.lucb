@@ -69,7 +69,9 @@ pub struct TileCache:
         return self.entries[at].texture
 
     ## Keep `texture` (this takes it over) for `key`, making room as needed.
-    pub mutating func put(key: u64, texture: gpu.Texture, bytes: usize) -> !:
+    ## Not `recent`, it is the first to go once its request is done: a tile
+    ## made only on the way to another (a pyramid's finer levels).
+    pub mutating func put(key: u64, texture: gpu.Texture, bytes: usize, recent: bool = true) -> !:
         self.misses += 1
         if let existing = self.map.find(key):
             self.drop((usize)existing)
@@ -78,7 +80,7 @@ pub struct TileCache:
             # Every entry is held: grow rather than fail.
             try self.grow()
         let at = self.free_slot() else trap("a grown cache has room")
-        self.entries[at] = CacheEntry(key = key, texture = texture, bytes = bytes, used = self.tick, recent = true, live = true)
+        self.entries[at] = CacheEntry(key = key, texture = texture, bytes = bytes, used = self.tick, recent = recent, live = true)
         try self.map.put(key, (u32)at)
         self.held_bytes += bytes
 
@@ -180,3 +182,23 @@ test "the cache keeps within its budget, drops the least wanted, and keeps what 
     cache.hold()
     try cache.put(20, try gpu.Texture.create(device, 16, 16, gpu.Format.rgba8_linear), 1024)
     assert(cache.bytes() <= 4096 and cache.find(20) != none)
+
+test "a tile kept as not recent goes before the tiles a request wanted":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    var cache = try TileCache.create(4096, 1024)
+    defer cache.destroy()
+    # Two wanted tiles and two made on the way to them.
+    cache.hold()
+    try cache.put(1, try gpu.Texture.create(device, 16, 16, gpu.Format.rgba8_linear), 1024)
+    try cache.put(2, try gpu.Texture.create(device, 16, 16, gpu.Format.rgba8_linear), 1024, recent = false)
+    try cache.put(3, try gpu.Texture.create(device, 16, 16, gpu.Format.rgba8_linear), 1024)
+    try cache.put(4, try gpu.Texture.create(device, 16, 16, gpu.Format.rgba8_linear), 1024, recent = false)
+    # Two more in the next request push out the two on the way, not the wanted ones.
+    cache.hold()
+    try cache.put(5, try gpu.Texture.create(device, 16, 16, gpu.Format.rgba8_linear), 1024)
+    try cache.put(6, try gpu.Texture.create(device, 16, 16, gpu.Format.rgba8_linear), 1024)
+    assert(cache.bytes() == 4096)
+    assert(cache.find(1) != none and cache.find(3) != none and cache.find(2) == none and cache.find(4) == none)
