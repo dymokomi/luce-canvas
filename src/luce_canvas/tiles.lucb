@@ -26,6 +26,14 @@ pub struct Tile:
 ## The last stamp handed out; tiles live on the main thread.
 var last_stamp: u64 = 0
 
+## How many tiles exist, shared ones once: a diagnostic of GPU memory held by
+## layers, masks, history and selections (caches count their own bytes).
+var live_tiles: usize = 0
+
+## How many tiles exist, each 512 KiB of GPU memory.
+pub func tiles_alive() -> usize:
+    return live_tiles
+
 func next_stamp() -> u64:
     last_stamp += 1
     return last_stamp
@@ -39,6 +47,7 @@ func release(tile: Tile*):
     if tile.references == 0:
         tile.texture.destroy()
         free(tile) in memory.heap
+        live_tiles -= 1
 
 ## A box of whole pixels: `left` and `top` inside, `right` and `bottom` just past.
 pub struct Bounds:
@@ -148,6 +157,7 @@ pub struct Tiles:
         if (try texture.width()) != tile_size or (try texture.height()) != tile_size or (try texture.pixel_format()) != gpu.Format.rgba16_float:
             error(invalid, "a tile is a 256 by 256 rgba16_float texture")
         let tile = try new Tile(texture = texture, references = 1, stamp = next_stamp()) in memory.heap
+        live_tiles += 1
         if let previous = self.cells[index]:
             release(previous)
         self.cells[index] = tile
@@ -464,6 +474,7 @@ pub struct Tiles:
             dropped.destroy()
             return
         let tile = try new Tile(texture = texture, references = 1, stamp = next_stamp()) in memory.heap
+        live_tiles += 1
         defer release(tile)
         if keep_inside:
             let index = try self.index((u32)column, (u32)row)
@@ -776,3 +787,22 @@ test "a cell reads back straight and writes back from premultiplied samples; a c
         cell[index] = 0.0
     try tiles.write_cell_premultiplied(1, 1, cell)
     assert(tiles.texture(1, 1) == none)
+
+test "tiles_alive counts each tile once, shared or not, until its last holder lets go":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    let start = tiles_alive()
+    var tiles = try Tiles.create(device, 600, 300)
+    try tiles.set(0, 0, try tiles.blank())
+    try tiles.share(1, 0, 0, 0)
+    try tiles.share(2, 1, 0, 0)
+    assert(tiles_alive() == start + 1)
+    var copy = try tiles.clone()
+    try tiles.set(1, 1, try tiles.blank())
+    assert(tiles_alive() == start + 2)
+    tiles.destroy()
+    assert(tiles_alive() == start + 1)
+    copy.destroy()
+    assert(tiles_alive() == start)
