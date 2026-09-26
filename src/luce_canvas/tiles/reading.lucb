@@ -1,0 +1,209 @@
+#==============================================================================================
+#
+#   tiles/reading - Many cells read back at once
+#
+#   DESCRIPTION:
+#       `read_cells` reads a list of cells through two of the device's read batches: while the
+#       caller works through one batch's cells, the next batch is already on the GPU. Each batch
+#       takes as many tiles as a readback slot holds (64 at 256 pixels in rgba16f), so a whole
+#       360-megapixel layer is about 90 submissions and waits rather than one per tile. Every
+#       reader of layer pixels (whole reads, single cells, bounds, the wand, heal) goes
+#       through here.
+#
+#==============================================================================================
+
+## A cell of the canvas grid.
+pub struct Cell:
+    pub var column: u32
+    pub var row: u32
+
+## One batch's share of the list: cells `first..<last`, and where each landed in
+## the batch (`empty_cell` for a cell with no tile).
+struct CellBatch:
+    var batch: gpu.ReadBatch
+    var first: usize
+    var last: usize
+    var offsets: usize[]
+    var submitted: bool
+    var pending: bool
+
+let empty_cell: usize = 0xffffffffffffffff
+
+## Read `cells` of `tiles` back and call `visit(context, cell, bytes)` for each,
+## in the list's order. `bytes` are the cell's rgba16f texels, rows 256 texels
+## (2048 bytes) apart, as many rows as the cell has; empty for a cell with no
+## tile (transparent). They are valid only during the call. Main thread only.
+pub func read_cells(tiles: const Tiles*, cells: const Cell[], context: void*?, visit: func(void*?, Cell, const u8[]) -> unit!) -> !:
+    if cells.length == 0:
+        return
+    let device = tiles.device()
+    var batches: CellBatch[2] = [CellBatch(batch = try gpu.ReadBatch.begin(device)), CellBatch(batch = gpu.ReadBatch())]
+    defer release_cell_batch(&batches[0])
+    batches[1].batch = try gpu.ReadBatch.begin(device)
+    defer release_cell_batch(&batches[1])
+    let per_batch = batches[0].batch.capacity() // cell_bytes()
+    if per_batch == 0:
+        error(invalid, "a read batch cannot hold one tile")
+    for index in 0..<(usize)2:
+        batches[index].offsets = try alloc usize[per_batch] in memory.heap
+    var next: usize = 0
+    next = try fill_cell_batch(tiles, cells, &batches[0], next)
+    if next < cells.length:
+        next = try fill_cell_batch(tiles, cells, &batches[1], next)
+    var turn: usize = 0
+    while batches[turn].pending:
+        let current = &batches[turn]
+        if current.submitted:
+            try current.batch.wait()
+        for index in current.first..<current.last:
+            let offset = current.offsets[index - current.first]
+            let cell = cells[index]
+            if offset == empty_cell:
+                var nothing: u8[]
+                try visit(context, cell, nothing)
+                continue
+            let rows = (usize)tiles.region(cell.column, cell.row).height
+            try visit(context, cell, try current.batch.bytes(offset, rows * (usize)tile_size * 8))
+        current.pending = false
+        if next < cells.length:
+            next = try fill_cell_batch(tiles, cells, current, next)
+        turn = 1 - turn
+
+## The bytes one cell takes in a batch.
+func cell_bytes() -> usize:
+    return (usize)tile_size * (usize)tile_size * 8
+
+## Record cells from `next` on into `target` until it is full, submit it, and
+## return where the list continues.
+func fill_cell_batch(tiles: const Tiles*, cells: const Cell[], target: CellBatch*, next: usize) -> usize!:
+    try target.batch.reset()
+    target.first = next
+    target.submitted = false
+    var at = next
+    while at < cells.length and at - next < target.offsets.length:
+        let cell = cells[at]
+        if let texture = tiles.texture(cell.column, cell.row):
+            let rows = tiles.region(cell.column, cell.row).height
+            let offset = (try target.batch.reserve(cell_bytes())) else break
+            try target.batch.copy(texture, gpu.Region(0, 0, tile_size, rows), offset)
+            target.offsets[at - next] = offset
+        else:
+            target.offsets[at - next] = empty_cell
+        at += 1
+    target.last = at
+    target.pending = true
+    if target.batch.copies() > 0:
+        try target.batch.submit()
+        target.submitted = true
+    return at
+
+func release_cell_batch(target: CellBatch*):
+    target.batch.finish()
+    if target.offsets.length > 0:
+        free(target.offsets) in memory.heap
+        var none_left: usize[]
+        target.offsets = none_left
+
+# mark: The Tiles readers on it ===============================================================
+
+## `read_cell`'s visitor: one cell into 256 by 256 straight RGBA f32 samples.
+func cell_to_floats(context: void*?, cell: Cell, bytes: const u8[]) -> !:
+    discard(cell)
+    let pixels = *(f32[]*)(context else trap("a cell read lost its buffer"))
+    halves_to_floats(bytes, pixels, (usize)tile_size, 0, 0, (usize)tile_size)
+
+## Where a whole read lands: the document's samples and its width.
+struct WholeRead:
+    var pixels: f32[]
+    var width: usize
+    var height: usize
+
+## `read`'s visitor: a cell into its place among the document's samples.
+func cell_into_whole(context: void*?, cell: Cell, bytes: const u8[]) -> !:
+    let whole = (WholeRead*)(context else trap("a layer read lost its buffer"))
+    let left = (usize)cell.column * (usize)tile_size
+    let top = (usize)cell.row * (usize)tile_size
+    let columns = min_usize((usize)tile_size, whole.width - left)
+    halves_to_floats(bytes, whole.pixels, columns, left, top, whole.width)
+
+## Half-float texels (rows 256 texels apart) to f32 samples at (`left`, `top`)
+## of `pixels`, `stride` samples of four wide, `columns` of each row. Empty
+## `bytes` leave the zeros already there.
+func halves_to_floats(bytes: const u8[], pixels: f32[], columns: usize, left: usize, top: usize, stride: usize):
+    let rows = bytes.length // ((usize)tile_size * 8)
+    for y in 0..<rows:
+        for x in 0..<columns:
+            let source = (y * (usize)tile_size + x) * 8
+            let destination = ((top + y) * stride + left + x) * 4
+            for channel in 0..<(usize)4:
+                pixels[destination + channel] = from_half((u16)bytes[source + channel * 2] | ((u16)bytes[source + channel * 2 + 1] << 8))
+
+## What `content_bounds` has found so far.
+struct BoundsRead:
+    var bounds: Bounds
+    var found: bool
+    var width: u32
+    var height: u32
+
+## `content_bounds`' visitor: grow the box by every pixel of the cell with any alpha.
+func cell_into_bounds(context: void*?, cell: Cell, bytes: const u8[]) -> !:
+    let read = (BoundsRead*)(context else trap("a bounds read lost its box"))
+    let left = (i64)(cell.column * tile_size)
+    let top = (i64)(cell.row * tile_size)
+    let columns = (usize)min_u32(tile_size, read.width - cell.column * tile_size)
+    let rows = bytes.length // ((usize)tile_size * 8)
+    for y in 0..<rows:
+        for x in 0..<columns:
+            let source = (y * (usize)tile_size + x) * 8
+            # Any alpha at all: the half's bits but the sign.
+            if ((u16)bytes[source + 6] | ((u16)bytes[source + 7] << 8)) & 0x7fff == 0:
+                continue
+            let px = left + (i64)x
+            let py = top + (i64)y
+            read.found = true
+            if px < read.bounds.left: read.bounds.left = px
+            if py < read.bounds.top: read.bounds.top = py
+            if px + 1 > read.bounds.right: read.bounds.right = px + 1
+            if py + 1 > read.bounds.bottom: read.bounds.bottom = py + 1
+
+## Collect into `list` the painted cells of ring `ring` of `cells` (0 the
+## outermost) that do not lie wholly inside `read`'s box so far: how many.
+func ring_cells(tiles: const Tiles*, cells: CellRange, ring: i64, read: const BoundsRead*, list: CellList*) -> usize!:
+    var count: usize = 0
+    for row in cells.top + ring..<cells.bottom - ring:
+        # Inner rows of the ring hold only its two side cells.
+        let edge = row == cells.top + ring or row == cells.bottom - ring - 1
+        var column = cells.left + ring
+        while column < cells.right - ring:
+            if tiles.texture((u32)column, (u32)row) != none and not inside_bounds(tiles, read, (u32)column, (u32)row):
+                if count == list.cells.length:
+                    let grown = try alloc Cell[list.cells.length * 2 + 64] in memory.heap
+                    memory.copy(grown, list.cells, count)
+                    list.release()
+                    list.cells = grown
+                list.cells[count] = Cell(column = (u32)column, row = (u32)row)
+                count += 1
+            if edge or column == cells.right - ring - 1:
+                column += 1
+            else:
+                column = cells.right - ring - 1
+    return count
+
+## A growable list of cells on the heap.
+struct CellList:
+    var cells: Cell[]
+
+    mutating func release():
+        if self.cells.length > 0:
+            free(self.cells) in memory.heap
+        var none_left: Cell[]
+        self.cells = none_left
+
+## Whether cell (`column`, `row`) lies wholly inside the box found so far.
+func inside_bounds(tiles: const Tiles*, read: const BoundsRead*, column: u32, row: u32) -> bool:
+    if not read.found:
+        return false
+    let area = tiles.region(column, row)
+    let left = (i64)(column * tile_size)
+    let top = (i64)(row * tile_size)
+    return left >= read.bounds.left and top >= read.bounds.top and left + (i64)area.width <= read.bounds.right and top + (i64)area.height <= read.bounds.bottom

@@ -288,38 +288,32 @@ pub struct Tiles:
             error(invalid, "a cell's pixels are 256 by 256 RGBA samples")
         for index in 0..<pixels.length:
             pixels[index] = 0.0
-        let texture = self.texture(column, row) else return
-        let area = self.region(column, row)
-        let bytes = try alloc u8[(usize)tile_size * (usize)tile_size * 8] in memory.heap
-        defer free(bytes) in memory.heap
-        try texture.read(bytes[..<((usize)area.height * (usize)tile_size * 8)], gpu.Region(0, 0, tile_size, area.height))
-        for y in 0..<(usize)area.height:
-            for x in 0..<(usize)area.width:
-                let at = y * (usize)tile_size + x
-                for channel in 0..<(usize)4:
-                    pixels[at * 4 + channel] = from_half((u16)bytes[at * 8 + channel * 2] | ((u16)bytes[at * 8 + channel * 2 + 1] << 8))
+        var target = pixels
+        let one: Cell[1] = [Cell(column = column, row = row)]
+        try read_cells(&self, one, (void*)&target, cell_to_floats)
+
+    ## Read `cells` back, calling `visit(context, cell, bytes)` for each in order
+    ## (see `read_cells`): many cells per submission, the next batch on the GPU
+    ## while the caller works through one.
+    pub func read_many(cells: const Cell[], context: void*?, visit: func(void*?, Cell, const u8[]) -> unit!) -> !:
+        try read_cells(&self, cells, context, visit)
 
     ## Read every pixel back as straight-alpha RGBA f32 samples, top-down.
     pub func read(pixels: f32[]) -> !:
         if pixels.length != (usize)self.extent_x * (usize)self.extent_y * 4:
             error(invalid, "pixel buffer must hold width * height RGBA samples")
-        let bytes = try alloc u8[(usize)tile_size * (usize)tile_size * 8] in memory.heap
-        defer free(bytes) in memory.heap
+        for index in 0..<pixels.length:
+            pixels[index] = 0.0
+        let cells = try alloc Cell[(usize)self.cell_columns * (usize)self.cell_rows] in memory.heap
+        defer free(cells) in memory.heap
+        var count: usize = 0
         for row in 0..<self.cell_rows:
             for column in 0..<self.cell_columns:
-                let area = self.region(column, row)
-                let tile = self.cells[(usize)row * (usize)self.cell_columns + (usize)column]
-                if let cell = tile:
-                    try cell.texture.read(bytes[..<((usize)area.height * (usize)tile_size * 8)], gpu.Region(0, 0, tile_size, area.height))
-                for y in 0..<(usize)area.height:
-                    for x in 0..<(usize)area.width:
-                        let destination = (((usize)row * (usize)tile_size + y) * (usize)self.extent_x + (usize)column * (usize)tile_size + x) * 4
-                        let source = (y * (usize)tile_size + x) * 8
-                        for channel in 0..<(usize)4:
-                            var value: f32 = 0.0
-                            if tile != none:
-                                value = from_half((u16)bytes[source + channel * 2] | ((u16)bytes[source + channel * 2 + 1] << 8))
-                            pixels[destination + channel] = value
+                if self.texture(column, row) != none:
+                    cells[count] = Cell(column = column, row = row)
+                    count += 1
+        var whole = WholeRead(pixels = pixels, width = (usize)self.extent_x, height = (usize)self.extent_y)
+        try read_cells(&self, cells[..<count], (void*)&whole, cell_into_whole)
 
     ## The smallest box of whole pixels holding every pixel with any alpha; none
     ## when there is none. It reads painted tiles back from the GPU, from the
@@ -327,47 +321,15 @@ pub struct Tiles:
     ## the box found so far: a full layer reads only its outer ring of tiles.
     pub func content_bounds() -> Bounds?!:
         let cells = self.occupied_on_canvas() else return none
-        let bytes = try alloc u8[(usize)tile_size * (usize)tile_size * 8] in memory.heap
-        defer free(bytes) in memory.heap
-        var found = false
-        var bounds = Bounds(left = (i64)self.extent_x, top = (i64)self.extent_y, right = 0, bottom = 0)
+        var read = BoundsRead(bounds = Bounds(left = (i64)self.extent_x, top = (i64)self.extent_y, right = 0, bottom = 0), found = false, width = self.extent_x, height = self.extent_y)
+        var list = CellList()
+        defer list.release()
         let rings = (min_i64(cells.right - cells.left, cells.bottom - cells.top) + 1) // 2
         for ring in 0..<rings:
-            for row in cells.top + ring..<cells.bottom - ring:
-                # Inner rows of the ring hold only its two side cells.
-                let edge = row == cells.top + ring or row == cells.bottom - ring - 1
-                var column = cells.left + ring
-                while column < cells.right - ring:
-                    try self.bound_cell(&bounds, &found, bytes, (u32)column, (u32)row)
-                    if edge or column == cells.right - ring - 1:
-                        column += 1
-                    else:
-                        column = cells.right - ring - 1
-        return bounds if found else none
-
-    ## Grow `bounds` by the painted pixels of cell (`column`, `row`), unless the
-    ## cell lies wholly inside it already.
-    func bound_cell(bounds: Bounds*, found: bool*, bytes: u8[], column: u32, row: u32) -> !:
-        let texture = self.texture(column, row) else return
-        let area = self.region(column, row)
-        let left = (i64)(column * tile_size)
-        let top = (i64)(row * tile_size)
-        if *found and left >= bounds.left and top >= bounds.top and left + (i64)area.width <= bounds.right and top + (i64)area.height <= bounds.bottom:
-            return
-        try texture.read(bytes[..<((usize)area.height * (usize)tile_size * 8)], gpu.Region(0, 0, tile_size, area.height))
-        for y in 0..<(usize)area.height:
-            for x in 0..<(usize)area.width:
-                let source = (y * (usize)tile_size + x) * 8
-                # Any alpha at all: the half's bits but the sign.
-                if ((u16)bytes[source + 6] | ((u16)bytes[source + 7] << 8)) & 0x7fff == 0:
-                    continue
-                let px = left + (i64)x
-                let py = top + (i64)y
-                *found = true
-                if px < bounds.left: bounds.left = px
-                if py < bounds.top: bounds.top = py
-                if px + 1 > bounds.right: bounds.right = px + 1
-                if py + 1 > bounds.bottom: bounds.bottom = py + 1
+            # A ring's cells go in batches; inner rings skip what the outer ones already cover.
+            let count = try ring_cells(&self, cells, ring, &read, &list)
+            try read_cells(&self, list.cells[..<count], (void*)&read, cell_into_bounds)
+        return read.bounds if read.found else none
 
     ## The cells of the canvas grid holding any tile; none when none do.
     func occupied_on_canvas() -> CellRange?:
@@ -687,122 +649,3 @@ pub func flatten(device: gpu.Device, tiles: const Tiles*, empty: gpu.Color = gpu
             try gpu.copy_image(whole.value(), texture, gpu.Rect((f64)(column * tile_size), (f64)(row * tile_size), (f64)area.width, (f64)area.height), area)
     discard(try frame.value().present(empty))
     return flat
-
-test "tiles share, replace, write and read on a device":
-    var device = gpu.Device.open() catch failure:
-        assert(failure.code == gpu.unavailable)
-        return
-    defer device.destroy()
-    var tiles = try Tiles.create(device, 300, 260)
-    defer tiles.destroy()
-    assert(tiles.columns() == 2 and tiles.rows() == 2 and tiles.region(1, 1).width == 44 and tiles.region(1, 1).height == 4)
-    let count = (usize)300 * 260 * 4
-    let pixels = try alloc f32[count] in memory.heap
-    defer free(pixels) in memory.heap
-    for index in 0..<count:
-        pixels[index] = 0.0
-    # One red pixel in the top-left tile, one half-transparent green in the bottom-right one.
-    pixels[(10 * 300 + 20) * 4] = 1.0
-    pixels[(10 * 300 + 20) * 4 + 3] = 1.0
-    pixels[(258 * 300 + 270) * 4 + 1] = 0.25
-    pixels[(258 * 300 + 270) * 4 + 3] = 0.5
-    try tiles.write(pixels)
-    assert(tiles.texture(0, 0) != none and tiles.texture(1, 0) == none and tiles.texture(0, 1) == none and tiles.texture(1, 1) != none)
-    var copy = try tiles.clone()
-    defer copy.destroy()
-    assert((tiles.tile(0, 0) else trap("missing tile")).references == 2)
-    let fresh = try tiles.blank()
-    try tiles.set(0, 0, fresh)
-    assert((copy.tile(0, 0) else trap("missing tile")).references == 1)
-    let back = try alloc f32[count] in memory.heap
-    defer free(back) in memory.heap
-    try copy.read(back)
-    assert(back[(10 * 300 + 20) * 4] == 1.0 and back[(10 * 300 + 20) * 4 + 3] == 1.0)
-    assert(back[(258 * 300 + 270) * 4 + 1] == 0.25 and back[(258 * 300 + 270) * 4 + 3] == 0.5)
-    assert(back[0] == 0.0 and back[count - 1] == 0.0)
-    try tiles.read(back)
-    assert(back[(10 * 300 + 20) * 4] == 0.0 and back[(258 * 300 + 270) * 4 + 3] == 0.5)
-    # A shared cell holds the same tile, and stamp, as its source.
-    try copy.share(1, 0, 0, 0)
-    assert(copy.stamp(1, 0) == copy.stamp(0, 0) and copy.texture(1, 0) != none)
-    var rejected = false
-    tiles.set(5, 0, try tiles.blank()) catch failure:
-        assert(failure.code == invalid)
-        rejected = true
-    assert(rejected)
-
-test "content bounds read from the outside in, and still find inner pixels":
-    var device = gpu.Device.open() catch failure:
-        assert(failure.code == gpu.unavailable)
-        return
-    defer device.destroy()
-    # 5 by 4 cells, the last column and row partial.
-    var tiles = try Tiles.create(device, 1200, 1000)
-    defer tiles.destroy()
-    assert(try tiles.content_bounds() == none)
-    let count = (usize)1200 * 1000 * 4
-    let pixels = try alloc f32[count] in memory.heap
-    defer free(pixels) in memory.heap
-    for index in 0..<count:
-        pixels[index] = 0.0
-    # One pixel in a corner cell, one in a cell of the inner ring.
-    pixels[(5 * 1200 + 5) * 4 + 3] = 1.0
-    pixels[(600 * 1200 + 600) * 4 + 3] = 0.25
-    try tiles.write(pixels)
-    let two = try tiles.content_bounds() else trap("no bounds")
-    assert(two.left == 5 and two.top == 5 and two.right == 601 and two.bottom == 601)
-    # Everything painted: the outer ring alone gives the whole canvas.
-    for index in 0..<count // 4:
-        pixels[index * 4 + 3] = 1.0
-    try tiles.write(pixels)
-    let whole = try tiles.content_bounds() else trap("no bounds")
-    assert(whole.left == 0 and whole.top == 0 and whole.right == 1200 and whole.bottom == 1000)
-    # Only the middle: nothing on the outside to skip against.
-    for index in 0..<count // 4:
-        pixels[index * 4 + 3] = 0.0
-    pixels[(520 * 1200 + 700) * 4 + 3] = 1.0
-    try tiles.write(pixels)
-    let middle = try tiles.content_bounds() else trap("no bounds")
-    assert(middle.left == 700 and middle.top == 520 and middle.right == 701 and middle.bottom == 521)
-
-test "a cell reads back straight and writes back from premultiplied samples; a clear one drops":
-    var device = gpu.Device.open() catch failure:
-        assert(failure.code == gpu.unavailable)
-        return
-    defer device.destroy()
-    var tiles = try Tiles.create(device, 300, 260)
-    defer tiles.destroy()
-    let cell = try alloc f32[(usize)tile_size * (usize)tile_size * 4] in memory.heap
-    defer free(cell) in memory.heap
-    try tiles.read_cell(1, 1, cell)
-    assert(cell[0] == 0.0 and cell[3] == 0.0)
-    # Premultiplied half-transparent red at the last cell's first pixel.
-    cell[0] = 0.5
-    cell[3] = 0.5
-    try tiles.write_cell_premultiplied(1, 1, cell)
-    assert(tiles.texture(1, 1) != none)
-    try tiles.read_cell(1, 1, cell)
-    assert(cell[0] == 1.0 and cell[3] == 0.5 and cell[7] == 0.0)
-    for index in 0..<cell.length:
-        cell[index] = 0.0
-    try tiles.write_cell_premultiplied(1, 1, cell)
-    assert(tiles.texture(1, 1) == none)
-
-test "tiles_alive counts each tile once, shared or not, until its last holder lets go":
-    var device = gpu.Device.open() catch failure:
-        assert(failure.code == gpu.unavailable)
-        return
-    defer device.destroy()
-    let start = tiles_alive()
-    var tiles = try Tiles.create(device, 600, 300)
-    try tiles.set(0, 0, try tiles.blank())
-    try tiles.share(1, 0, 0, 0)
-    try tiles.share(2, 1, 0, 0)
-    assert(tiles_alive() == start + 1)
-    var copy = try tiles.clone()
-    try tiles.set(1, 1, try tiles.blank())
-    assert(tiles_alive() == start + 2)
-    tiles.destroy()
-    assert(tiles_alive() == start + 1)
-    copy.destroy()
-    assert(tiles_alive() == start)

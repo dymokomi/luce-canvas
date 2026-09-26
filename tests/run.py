@@ -17,7 +17,10 @@ def main():
     for backend in ['--native', '--backend=c']:
         for module in MODULES:
             print(f'TEST {module} {backend}', flush=True)
-            subprocess.run([str(args.base.resolve()), 'test', str(ROOT / f'src/luce_canvas/{module}.lucb'), backend], check=True, cwd=ROOT, env=env, timeout=600)
+            # A module is a file, or a directory of files listed in its ORDER.
+            target = ROOT / f'src/luce_canvas/{module}'
+            target = target if target.is_dir() else target.with_suffix('.lucb')
+            subprocess.run([str(args.base.resolve()), 'test', str(target), backend], check=True, cwd=ROOT, env=env, timeout=600)
     print('PASS luce-canvas', flush=True)
 
 
