@@ -35,7 +35,7 @@ func make_tile(texture: gpu.Texture) -> Tile*!:
     var no_ram: u8[]
     var no_packed: u8[]
     let tile = try new Tile(texture = texture, on_gpu = true, ram = no_ram, references = 1, stamp = next_stamp(), used = residency_epoch, live = 0,
-                            disk = -1, disk_length = 0, packed = no_packed, raw_only = false, source = none, source_offset = 0, source_length = 0, source_rows = 0, previous = last_tile, next = none) in memory.heap
+                            disk = -1, disk_length = 0, packed = no_packed, raw_only = false, loading = false, source = none, source_offset = 0, source_length = 0, source_rows = 0, previous = last_tile, next = none) in memory.heap
     if let last = last_tile:
         last.next = tile
     else:

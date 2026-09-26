@@ -47,6 +47,8 @@ pub struct Tile:
     var packed: u8[]
     ## The codec found it did not pay to compress: it goes to disk whole.
     var raw_only: bool
+    ## A background batch is decoding it (tiles/prefetch).
+    var loading: bool
     ## The document file record that also holds it (tiles/backing), if any:
     ## such a tile leaves the GPU and RAM without being written anywhere.
     var source: TileSource*?

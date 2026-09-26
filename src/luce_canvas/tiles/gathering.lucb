@@ -74,13 +74,24 @@ func drop_all_packed(list: Tile*[]):
 
 ## Tiles from any stores to bring back into RAM together: each added one
 ## that is only somewhere slower waits, and every 64 go back as one batch.
+## A deferred gathering keeps them all instead, and `finish` hands them to a
+## background batch (tiles/prefetch): what a frame that must not wait lacks.
 pub struct Gathering:
     var list: Tile*[64]
     var count: usize
+    var later: bool
+    var waiting: Tile*[]
+    var waiting_count: usize
 
     pub static func create() -> Gathering:
         var list: Tile*[64] = ---
-        return Gathering(list = list, count = 0)
+        var none_waiting: Tile*[]
+        return Gathering(list = list, count = 0, later = false, waiting = none_waiting, waiting_count = 0)
+
+    pub static func deferred() -> Gathering:
+        var gathering = Gathering.create()
+        gathering.later = true
+        return gathering
 
     ## Add the tile at cell (`column`, `row`) of `tiles`, if it has one that
     ## is neither on the GPU nor in RAM.
@@ -88,16 +99,43 @@ pub struct Gathering:
         let tile = tiles.tile(column, row) else return
         if tile.on_gpu or tile.ram.length > 0:
             return
+        if self.later:
+            if self.waiting_count == self.waiting.length:
+                let grown = try alloc Tile*[max_usize(64, self.waiting.length * 2)] in memory.heap
+                if self.waiting_count > 0:
+                    memory.copy(grown, self.waiting, self.waiting_count)
+                    free(self.waiting) in memory.heap
+                self.waiting = grown
+            self.waiting[self.waiting_count] = tile
+            self.waiting_count += 1
+            return
         self.list[self.count] = tile
         self.count += 1
         if self.count == gather_batch:
             try self.finish()
 
-    ## Bring back the tiles still waiting.
+    ## How many tiles a deferred gathering holds so far.
+    pub func missing() -> usize:
+        return self.waiting_count
+
+    ## Bring back the tiles still waiting; a deferred gathering starts them
+    ## decoding in the background (unless a batch is already out).
     pub mutating func finish() -> !:
+        if self.later:
+            defer self.release()
+            discard(try prefetch_tiles(self.waiting[..<self.waiting_count]))
+            return
         let count = self.count
         self.count = 0
         try gather_tiles(self.list[..<count])
+
+    ## Let go of a deferred gathering's list without starting anything.
+    pub mutating func release():
+        if self.waiting.length > 0:
+            free(self.waiting) in memory.heap
+        var none_waiting: Tile*[]
+        self.waiting = none_waiting
+        self.waiting_count = 0
 
 ## `Tiles.gather`: the tiles at `cells` of `tiles` brought into RAM together.
 func gather_cells(tiles: const Tiles*, cells: const Cell[]) -> !:
