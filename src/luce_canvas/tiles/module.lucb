@@ -178,6 +178,12 @@ pub struct Tiles:
         let tile = self.tile(column, row) else return none
         return try pass_texture(tile, self.owner)
 
+    ## Bring the tiles at `cells` that are only somewhere slower (compressed,
+    ## in the scratch file, in the document file) into RAM together, decoded
+    ## across the processors: what a draw is about to ask for, one at a time.
+    pub func gather(cells: const Cell[]) -> !:
+        try gather_cells(&self, cells)
+
     ## Whether a cell holds a tile (is not transparent), without bringing it
     ## to the GPU.
     pub func painted(column: u32, row: u32) -> bool:

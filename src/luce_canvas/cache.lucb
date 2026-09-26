@@ -73,6 +73,10 @@ pub struct TileCache:
         if self.held_bytes > self.limit():
             self.make_room(0)
 
+    ## Whether a tile is kept for `key` (it is not marked used).
+    pub func has(key: u64) -> bool:
+        return self.map.find(key) != none
+
     ## The tile kept for `key`, borrowed; none when it is not kept.
     pub mutating func find(key: u64) -> gpu.Texture?:
         let slot = self.map.find(key) else return none

@@ -125,38 +125,10 @@ func fill_cell_batch(tiles: const Tiles*, cells: const Cell[], target: CellBatch
         target.submitted = true
     return at
 
-## The backed tiles among the next `most` cells from `next` that have no copy
-## anywhere, read in from their document file together (decoded across the
-## processors) rather than one by one as the batch is filled.
+## The next `most` cells from `next` that are only somewhere slower, brought
+## into RAM together (tiles/gathering) rather than one by one as the batch is filled.
 func fetch_batch(tiles: const Tiles*, cells: const Cell[], next: usize, most: usize) -> !:
-    let last = min_usize(cells.length, next + most)
-    var wanted: Tile*[64] = ---
-    var count: usize = 0
-    var packed: Tile*[64] = ---
-    var packed_count: usize = 0
-    for index in next..<last:
-        let tile = tiles.tile(cells[index].column, cells[index].row) else continue
-        if tile.on_gpu or tile.ram.length > 0:
-            continue
-        # Compressed in RAM: decoded together too.
-        if tile.packed.length > 0:
-            packed[packed_count] = tile
-            packed_count += 1
-            if packed_count == 64:
-                try unpack_many(packed[..<packed_count])
-                packed_count = 0
-            continue
-        if tile.disk >= 0 or not backed(tile):
-            continue
-        wanted[count] = tile
-        count += 1
-        if count == 64:
-            try fetch_many(wanted[..<count])
-            count = 0
-    if count > 0:
-        try fetch_many(wanted[..<count])
-    if packed_count > 0:
-        try unpack_many(packed[..<packed_count])
+    try gather_cells(tiles, cells[next..<min_usize(cells.length, next + most)])
 
 func release_cell_batch(target: CellBatch*):
     target.batch.finish()

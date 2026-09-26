@@ -1,0 +1,107 @@
+#==============================================================================================
+#
+#   tiles/gathering - Many tiles brought back into RAM together
+#
+#   DESCRIPTION:
+#       A tile that is neither on the GPU nor in RAM is somewhere slower: compressed in RAM,
+#       in the scratch file (whole or compressed), or in the document file it came from.
+#       Bringing such tiles back one at a time, as a draw first asks for each, decodes them
+#       one by one on the main thread. `gather_tiles` takes a batch of them at once: the
+#       reads go in order, then every decode runs across the processors. A draw gathers what
+#       the view is about to need first (`Tiles.gather`, the compositor), and a read of many
+#       cells gathers each batch; anything not gathered still comes back on its own.
+#
+#==============================================================================================
+
+## How many tiles one gathering batch holds.
+let gather_batch: usize = 64
+
+## Bring each of `list` that is only somewhere slower into RAM: compressed
+## copies and compressed scratch slots decoded across the processors, whole
+## scratch slots read, document-file tiles read and decoded together.
+func gather_tiles(list: Tile*[]) -> !:
+    var packed: Tile*[64] = ---
+    var packed_count: usize = 0
+    var slots: Tile*[64] = ---
+    var slot_count: usize = 0
+    var backed_tiles: Tile*[64] = ---
+    var backed_count: usize = 0
+    for tile in list[..<min_usize(list.length, gather_batch)]:
+        if tile.on_gpu or tile.ram.length > 0:
+            continue
+        if tile.packed.length > 0:
+            packed[packed_count] = tile
+            packed_count += 1
+        elif tile.disk >= 0 and tile.disk_length > 0:
+            slots[slot_count] = tile
+            slot_count += 1
+        elif tile.disk >= 0:
+            # A whole slot is a plain read: no decode to spread.
+            try ensure_ram(tile)
+        elif backed(tile):
+            backed_tiles[backed_count] = tile
+            backed_count += 1
+    try unpack_many(packed[..<packed_count])
+    try load_packed_slots(slots[..<slot_count])
+    try fetch_many(backed_tiles[..<backed_count])
+    if list.length > gather_batch:
+        try gather_tiles(list[gather_batch..])
+
+## Bring the tiles whose scratch slots hold them compressed back into RAM: the
+## compressed bytes read in order, then decoded across the processors. The
+## slots stay (spilling again is free), so no compressed copy is kept.
+func load_packed_slots(list: Tile*[]) -> !:
+    if list.length == 0:
+        return
+    let file = try scratch_file()
+    defer drop_all_packed(list)
+    for tile in list:
+        let packed = try alloc u8[(usize)tile.disk_length] in memory.heap
+        tile.packed = packed
+        packed_tile_bytes += packed.length
+        discard(try file.seek(tile.disk))
+        var read: usize = 0
+        while read < packed.length:
+            let count = try file.read(packed[read..])
+            if count == 0:
+                error(invalid, "the scratch file ended inside a tile")
+            read += count
+    try unpack_many(list)
+
+func drop_all_packed(list: Tile*[]):
+    for tile in list:
+        drop_packed(tile)
+
+## Tiles from any stores to bring back into RAM together: each added one
+## that is only somewhere slower waits, and every 64 go back as one batch.
+pub struct Gathering:
+    var list: Tile*[64]
+    var count: usize
+
+    pub static func create() -> Gathering:
+        var list: Tile*[64] = ---
+        return Gathering(list = list, count = 0)
+
+    ## Add the tile at cell (`column`, `row`) of `tiles`, if it has one that
+    ## is neither on the GPU nor in RAM.
+    pub mutating func add(tiles: const Tiles*, column: u32, row: u32) -> !:
+        let tile = tiles.tile(column, row) else return
+        if tile.on_gpu or tile.ram.length > 0:
+            return
+        self.list[self.count] = tile
+        self.count += 1
+        if self.count == gather_batch:
+            try self.finish()
+
+    ## Bring back the tiles still waiting.
+    pub mutating func finish() -> !:
+        let count = self.count
+        self.count = 0
+        try gather_tiles(self.list[..<count])
+
+## `Tiles.gather`: the tiles at `cells` of `tiles` brought into RAM together.
+func gather_cells(tiles: const Tiles*, cells: const Cell[]) -> !:
+    var pending = Gathering.create()
+    for cell in cells:
+        try pending.add(tiles, cell.column, cell.row)
+    try pending.finish()

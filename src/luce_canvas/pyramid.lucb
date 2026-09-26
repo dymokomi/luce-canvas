@@ -21,7 +21,7 @@
 
 import gpu
 import memory
-from luce_canvas.tiles import Tiles, tile_size, min_u32, tile_texture, transient_mark, release_transients
+from luce_canvas.tiles import Gathering, Tiles, tile_size, min_u32, tile_texture, transient_mark, release_transients
 from luce_canvas.cache import TileCache
 from luce_canvas.shaders import halve_frag_words, halve_frag_msl
 from luce_canvas.half import from_half
@@ -115,6 +115,22 @@ pub struct Pyramid:
         self.renders += 1
         try self.cache.put(key, texture, tile_bytes, recent = wanted, precious = precious_level(tiles.width(), tiles.height(), level))
         return texture
+
+    ## Add to `pending` the level-0 tiles that making cell (`column`, `row`) of
+    ## `level` would otherwise bring back one at a time: those under the level
+    ## tiles not kept (tiles/gathering). A draw gathers them first, from every
+    ## store it shows, then brings them back together.
+    pub func gather(tiles: const Tiles*, column: u32, row: u32, level: u32, mask: bool, pending: Gathering*) -> !:
+        if not cell_exists(tiles, column, row, level):
+            return
+        if level == 0:
+            try pending.add(tiles, column, row)
+            return
+        let key = level_key(tiles, column, row, level, mask)
+        if key == 0 or self.cache.has(key):
+            return
+        for quarter in 0..<(u32)4:
+            try self.gather(tiles, column * 2 + quarter % 2, row * 2 + quarter // 2, level - 1, mask, pending)
 
     ## What the level tiles keep, in bytes.
     pub func bytes() -> usize:
