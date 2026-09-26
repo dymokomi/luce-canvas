@@ -135,7 +135,44 @@ test "packing keeps only the compressed copy in RAM, and unpacking many brings e
     defer free(after) in memory.heap
     assert(same_samples(before, after))
 
+test "gathering brings compressed slots, compressed copies and whole slots back together, exactly":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    defer residency_budgets(0, 0)
+    residency_codec(none, runs_encode, runs_decode, tile_bytes * 2)
+    defer clear_codec()
+    var tiles = try patched_layer(device)
+    defer tiles.destroy()
+    let before = try read_all(&tiles)
+    defer free(before) in memory.heap
+    # Everything off the GPU and out of RAM: packed to slots, the noise whole.
+    residency_budgets(tile_bytes, tile_bytes)
+    residency_advance()
+    try residency_settle(device)
+    var cells: Cell[8] = ---
+    var count: usize = 0
+    for row in 0..<(u32)2:
+        for column in 0..<(u32)4:
+            let tile = tiles.tile(column, row) else trap("a painted cell")
+            if tile.ram.length == 0 and not tile.on_gpu:
+                cells[count] = Cell(column = column, row = row)
+                count += 1
+    assert(count > 1)
+    let loads = residency_report().loads
+    let packed = packed_tile_bytes
+    try tiles.gather(cells[..<count])
+    # Each came back once, decoded, and no compressed copy of a slotted tile stays behind.
+    assert(residency_report().loads == loads + (u64)count)
+    assert(packed_tile_bytes <= packed)
+    for index in 0..<count:
+        let tile = tiles.tile(cells[index].column, cells[index].row) else trap("a painted cell")
+        assert(tile.ram.length == tile_bytes)
+    let after = try read_all(&tiles)
+    defer free(after) in memory.heap
+    assert(same_samples(before, after))
+
 func clear_codec():
-    codec_encode = none
+    clear_residency_codec()
     codec_decode = none
-    codec_bound = 0

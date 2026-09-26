@@ -11,7 +11,9 @@
 #       scratch). A tile that does not compress to three quarters of its size is marked and
 #       goes to disk whole. Compressing and decoding run across the processors, a batch of
 #       tiles at a time. The compressed copy stays when a tile comes back, so moving it out
-#       again is free; drawing into a tile in place drops it.
+#       again is free; drawing into a tile in place drops it. The tier exists only while the
+#       application sets a codec (`residency_codec`): on a fast SSD deflate costs more than
+#       the writes it saves, so it is for slow or small scratch disks.
 #
 #==============================================================================================
 
@@ -36,6 +38,12 @@ pub func residency_codec(context: void*?, encode: TileEncode, decode: TileDecode
     codec_encode = encode
     codec_decode = decode
     codec_bound = bound
+
+## No compressed tier: tiles past the RAM budget go to disk whole. Tiles held
+## compressed now stay so until they come back.
+pub func clear_residency_codec():
+    codec_encode = none
+    codec_bound = 0
 
 ## Whether a codec is set.
 func has_codec() -> bool:

@@ -77,7 +77,8 @@ pub struct ResidencyReport:
     pub var promotions: u64
     pub var demotions: u64
     pub var transient_uploads: u64
-    ## Tiles in the scratch file, and moves out to it and back.
+    ## Bytes written into the scratch file (a compressed tile's at its own
+    ## length), and moves out to it and back.
     pub var disk_tiles: usize
     pub var spills: u64
     pub var loads: u64

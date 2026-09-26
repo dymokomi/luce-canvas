@@ -25,7 +25,8 @@ var scratch: files.File*? = none
 var scratch_end: i64 = 0
 var free_slots: i64[]
 var free_count: usize = 0
-## Bytes of tiles held in slots, and tiles written out and read back.
+## Bytes written into slots (a compressed tile's own length), and tiles
+## written out and read back.
 var disk_tile_bytes: usize = 0
 var residency_spills: u64 = 0
 var residency_loads: u64 = 0
@@ -237,7 +238,7 @@ func spill_packed(tile: Tile*) -> !:
             written += count
         tile.disk = offset
         tile.disk_length = (u32)tile.packed.length
-        disk_tile_bytes += tile_bytes
+        disk_tile_bytes += tile.packed.length
     drop_packed(tile)
     residency_spills += 1
 
@@ -300,5 +301,5 @@ func release_disk(tile: Tile*):
         return
     try_give_slot(tile.disk)
     tile.disk = -1
+    disk_tile_bytes -= (usize)tile.disk_length if tile.disk_length > 0 else tile_bytes
     tile.disk_length = 0
-    disk_tile_bytes -= tile_bytes
