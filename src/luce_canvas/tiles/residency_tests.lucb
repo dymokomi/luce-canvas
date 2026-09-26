@@ -168,3 +168,37 @@ test "tiles only history holds leave the GPU before the tiles a document shows":
     residency_mark_live(&shown)
     try residency_settle(device)
     assert(gpu_count(&shown) == 8 and gpu_count(&history) < 8)
+
+test "a tile drawn into in place lets its warm RAM copy go, so reads see the new pixels":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    defer residency_budgets(0, 0)
+    # Room in RAM: reading keeps warm copies of what it reads.
+    residency_budgets(0, (usize)1 << 30)
+    var tiles = try distinct_layer(device, 0.5)
+    defer tiles.destroy()
+    let first = try read_all(&tiles)
+    defer free(first) in memory.heap
+    let tile = tiles.tile(1, 0) else trap("a painted cell")
+    assert(tile.ram.length > 0)
+    # Draw into the cell's texture in place: every texel half-transparent black.
+    let texture = (try tiles.texture(1, 0)) else trap("a painted cell")
+    let texels = try alloc u8[(usize)tile_size * (usize)tile_size * 8] in memory.heap
+    defer free(texels) in memory.heap
+    for at in 0..<texels.length // 8:
+        let alpha = to_half(0.5)
+        for byte in 0..<(usize)6:
+            texels[at * 8 + byte] = 0
+        texels[at * 8 + 6] = (u8)(alpha & 0xff)
+        texels[at * 8 + 7] = (u8)(alpha >> 8)
+    try texture.upload(texels)
+    try tiles.redrawn(1, 0)
+    assert(tile.ram.length == 0)
+    let second = try read_all(&tiles)
+    defer free(second) in memory.heap
+    let inside = ((10 * 1024) + 256 + 10) * 4
+    assert(second[inside] == 0.0 and second[inside + 3] == 0.5)
+    # The other cells still read as before.
+    assert(second[(10 * 1024 + 10) * 4] == first[(10 * 1024 + 10) * 4])

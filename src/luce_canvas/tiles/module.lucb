@@ -226,12 +226,16 @@ pub struct Tiles:
         let tile = self.tile(column, row) else return false
         return tile.references == 1
 
-    ## The cell's tile, held here alone, was drawn into again: a new stamp.
+    ## The cell's tile, held here alone, was drawn into again on the GPU: a new
+    ## stamp, and a RAM copy of what it held before is let go, so a read never
+    ## serves the old pixels.
     pub mutating func redrawn(column: u32, row: u32) -> !:
         let tile = self.tile(column, row) else error(invalid, "no tile to redraw")
         if tile.references != 1:
             error(invalid, "a shared tile cannot be redrawn")
         tile.stamp = next_stamp()
+        if tile.on_gpu:
+            drop_ram_copy(tile)
 
     ## Make a cell transparent again.
     pub mutating func clear(column: u32, row: u32) -> !:
