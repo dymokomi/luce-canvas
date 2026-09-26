@@ -177,3 +177,39 @@ test "read_cells reads more cells than a batch holds, in order, empty ones as no
     try tiles.read(back)
     for index in 0..<count:
         assert(back[index] == pixels[index])
+
+test "writing band by band makes the same tiles as writing the whole picture":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    let width: usize = 600
+    let height: usize = 530
+    let pixels = try alloc f32[width * height * 4] in memory.heap
+    defer free(pixels) in memory.heap
+    for at in 0..<width * height:
+        let x = at % width
+        let y = at // width
+        pixels[at * 4] = (f32)x / (f32)width
+        pixels[at * 4 + 1] = (f32)y / (f32)height
+        pixels[at * 4 + 2] = 0.25
+        # A clear cell at the top-left, to be dropped both ways.
+        pixels[at * 4 + 3] = 0.0 if x < 256 and y < 256 else 0.75
+    var whole = try Tiles.create(device, (u32)width, (u32)height)
+    defer whole.destroy()
+    try whole.write(pixels)
+    var banded = try Tiles.create(device, (u32)width, (u32)height)
+    defer banded.destroy()
+    for row in 0..<banded.rows():
+        let top = (usize)row * (usize)tile_size
+        let rows = min_usize((usize)tile_size, height - top)
+        try banded.write_band(row, pixels[top * width * 4..<(top + rows) * width * 4])
+    let a = try alloc f32[width * height * 4] in memory.heap
+    defer free(a) in memory.heap
+    let b = try alloc f32[width * height * 4] in memory.heap
+    defer free(b) in memory.heap
+    try whole.read(a)
+    try banded.read(b)
+    for index in 0..<a.length:
+        assert(a[index] == b[index])
+    assert(not banded.painted(0, 0) and banded.painted(1, 0))

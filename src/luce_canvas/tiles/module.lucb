@@ -283,17 +283,39 @@ pub struct Tiles:
         let painted = try alloc bool[columns] in memory.heap
         defer free(painted) in memory.heap
         for row in 0..<self.cell_rows:
-            var job = WriteJob(pixels = pixels, band = band, painted = painted, extent_x = self.extent_x, extent_y = self.extent_y, row = row, first = 0, last = columns)
-            try run_bands(&job, columns)
-            for column in 0..<self.cell_columns:
-                if not painted[(usize)column]:
-                    try self.clear(column, row)
-                    continue
-                var texture = try tile_texture(self.owner)
-                errdefer texture.destroy()
-                let at = (usize)column * per_tile
-                try texture.upload(band[at..<at + per_tile])
-                try self.set(column, row, texture)
+            try self.write_cells_of(row, pixels, 0, band, painted)
+
+    ## Replace row `row` of cells from `pixels`: straight-alpha linear RGBA f32
+    ## samples of the rows that row of cells covers only (256 of them, fewer in
+    ## the last), the document's width. What a picture loads through a band at a
+    ## time, never whole.
+    pub mutating func write_band(row: u32, pixels: const f32[]) -> !:
+        let rows = (usize)min_u32(tile_size, self.extent_y - row * tile_size)
+        if row >= self.cell_rows or pixels.length != (usize)self.extent_x * rows * 4:
+            error(invalid, "a band holds its row of cells' pixel rows, the document's width")
+        let columns = (usize)self.cell_columns
+        let per_tile = (usize)tile_size * (usize)tile_size * 8
+        let band = try alloc u8[columns * per_tile] in memory.heap
+        defer free(band) in memory.heap
+        let painted = try alloc bool[columns] in memory.heap
+        defer free(painted) in memory.heap
+        try self.write_cells_of(row, pixels, (usize)row * (usize)tile_size, band, painted)
+
+    ## Row `row` of cells from `pixels`, whose first row is document row `origin`.
+    mutating func write_cells_of(row: u32, pixels: const f32[], origin: usize, band: u8[], painted: bool[]) -> !:
+        let columns = (usize)self.cell_columns
+        let per_tile = (usize)tile_size * (usize)tile_size * 8
+        var job = WriteJob(pixels = pixels, band = band, painted = painted, extent_x = self.extent_x, extent_y = self.extent_y, row = row, origin = origin, first = 0, last = columns)
+        try run_bands(&job, columns)
+        for column in 0..<self.cell_columns:
+            if not painted[(usize)column]:
+                try self.clear(column, row)
+                continue
+            var texture = try tile_texture(self.owner)
+            errdefer texture.destroy()
+            let at = (usize)column * per_tile
+            try texture.upload(band[at..<at + per_tile])
+            try self.set(column, row, texture)
 
     ## Replace cell (`column`, `row`) with `pixels`, one cell's premultiplied
     ## RGBA f32 samples, 256 rows of 256 whatever the cell's size (past the
@@ -619,6 +641,8 @@ struct WriteJob:
     var extent_x: u32
     var extent_y: u32
     var row: u32
+    ## The document row `pixels` begins at: 0 for the whole picture, the band's top for a band.
+    var origin: usize
     var first: usize
     var last: usize
 
@@ -641,7 +665,7 @@ func write_cells(job: WriteJob*):
                     for index in 0..<(usize)8:
                         bytes[destination + index] = 0
                     continue
-                let source = ((top + y) * (usize)job.extent_x + left + x) * 4
+                let source = ((top + y - job.origin) * (usize)job.extent_x + left + x) * 4
                 for channel in 0..<(usize)4:
                     let half = to_half(job.pixels[source + channel])
                     bytes[destination + channel * 2] = (u8)(half & 0xff)
