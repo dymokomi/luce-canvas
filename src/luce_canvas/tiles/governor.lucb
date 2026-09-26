@@ -47,6 +47,7 @@ var cache_scale_now: f64 = 1.0
 ## Moves made, for tests and reports.
 var residency_promotions: u64 = 0
 var residency_demotions: u64 = 0
+var residency_transient_uploads: u64 = 0
 ## Tile allocations a test wants to fail as if the device were out of memory.
 var residency_failures: usize = 0
 
@@ -62,6 +63,7 @@ pub struct ResidencyReport:
     pub var ram_budget: usize
     pub var promotions: u64
     pub var demotions: u64
+    pub var transient_uploads: u64
 
 # mark: The governor's controls (one set per process; tiles live on the main thread) ==========
 
@@ -111,9 +113,11 @@ pub func residency_settle(device: gpu.Device) -> !:
     if gpu_budget > 0:
         let held = gpu_tile_bytes + derived_tile_bytes
         if held > gpu_budget:
-            cache_scale_now = max_f64(0.125, cache_scale_now * 0.5)
             let target = gpu_budget // 100 * 85
-            discard(try evict(device, held - target))
+            let wanted = held - target
+            # Derived caches shrink only when layer tiles moving to RAM is not enough.
+            if (try evict(device, wanted)) < wanted:
+                cache_scale_now = max_f64(0.25, cache_scale_now * 0.5)
         elif held < gpu_budget // 10 * 6:
             cache_scale_now = min_f64(1.0, cache_scale_now * 1.25)
     if ram_budget > 0 and ram_tile_bytes > ram_budget:
@@ -136,13 +140,15 @@ pub func residency_fail_allocations(count: usize):
 
 pub func residency_report() -> ResidencyReport:
     return ResidencyReport(gpu_tiles = gpu_tile_bytes, ram_tiles = ram_tile_bytes, derived = derived_tile_bytes, gpu_budget = gpu_budget, ram_budget = ram_budget,
-                           promotions = residency_promotions, demotions = residency_demotions)
+                           promotions = residency_promotions, demotions = residency_demotions, transient_uploads = residency_transient_uploads)
 
 ## The device is out of memory: shrink derived caches and move unpinned tiles
 ## to RAM, `wanted` bytes' worth, least wanted first. Bytes freed.
 func relieve(device: gpu.Device, wanted: usize) -> usize!:
-    cache_scale_now = max_f64(0.125, cache_scale_now * 0.5)
-    return try evict(device, wanted)
+    let freed = try evict(device, wanted)
+    if freed < wanted:
+        cache_scale_now = max_f64(0.25, cache_scale_now * 0.5)
+    return freed
 
 ## Whether a tile read back anyway may keep a RAM copy: not on unified memory,
 ## and while warm copies take under half the RAM budget.

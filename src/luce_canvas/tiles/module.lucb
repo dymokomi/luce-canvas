@@ -152,6 +152,14 @@ pub struct Tiles:
         let tile = self.tile(column, row) else return none
         return try resident(tile, self.owner)
 
+    ## The tile texture at a cell for one pass recorded now, or `none` when
+    ## transparent: a tile kept only in RAM gets a transient upload that stays
+    ## until `release_transients` back to a mark taken before, and the tile
+    ## stays in RAM. What derived tiles (levels, composites) are made from.
+    pub func pass_texture(column: u32, row: u32) -> gpu.Texture?!:
+        let tile = self.tile(column, row) else return none
+        return try pass_texture(tile, self.owner)
+
     ## Whether a cell holds a tile (is not transparent), without bringing it
     ## to the GPU.
     pub func painted(column: u32, row: u32) -> bool:

@@ -15,6 +15,12 @@
 #       memory costs speed rather than an error. `demote` moves tiles to RAM a batch of
 #       readbacks at a time. Every tile is in one list, which the governor walks.
 #
+#       Making a derived tile (a pyramid level, a composite) needs its sources on the GPU for
+#       one pass only. `pass_texture` gives a RAM-only tile a transient upload for that pass
+#       and leaves the tile in RAM; the maker releases its transients (`release_transients`,
+#       back to the mark it took) once the pass is submitted. So a view at fit, or an export,
+#       of a document mostly in RAM costs uploads, never a document's worth of GPU memory.
+#
 #==============================================================================================
 
 ## Bytes of one tile's content, on the GPU or in RAM: 256 by 256 half-float RGBA.
@@ -68,6 +74,52 @@ func drop_ram_copy(tile: Tile*):
     var no_ram: u8[]
     tile.ram = no_ram
     ram_tile_bytes -= tile_bytes
+
+## Uploads made for one pass, destroyed when their maker releases them.
+struct Transients:
+    var textures: gpu.Texture[]
+    var count: usize
+
+var transient_store: Transients*? = none
+
+## A texture for one pass over `tile`: its own when on the GPU (pinned as
+## `resident` pins it), else a transient upload of its RAM copy, the tile
+## itself staying in RAM.
+func pass_texture(tile: Tile*, device: gpu.Device) -> gpu.Texture!:
+    if tile.on_gpu:
+        tile.used = residency_epoch
+        return tile.texture
+    var texture = try tile_texture(device)
+    errdefer texture.destroy()
+    try texture.upload(tile.ram)
+    try keep_transient(texture)
+    residency_transient_uploads += 1
+    return texture
+
+func keep_transient(texture: gpu.Texture) -> !:
+    if transient_store == none:
+        transient_store = try new Transients(textures = try alloc gpu.Texture[64] in memory.heap, count = 0) in memory.heap
+    let store = transient_store else trap("made")
+    if store.count == store.textures.length:
+        let grown = try alloc gpu.Texture[store.textures.length * 2] in memory.heap
+        memory.copy(grown, store.textures, store.count)
+        free(store.textures) in memory.heap
+        store.textures = grown
+    store.textures[store.count] = texture
+    store.count += 1
+
+## Where the transient list stands now: what a maker releases back to.
+pub func transient_mark() -> usize:
+    let store = transient_store else return 0
+    return store.count
+
+## Destroy the transient uploads made since `mark`: the passes using them
+## have been submitted (work in flight keeps them alive until it completes).
+pub func release_transients(mark: usize):
+    let store = transient_store else return
+    while store.count > mark:
+        store.count -= 1
+        store.textures[store.count].destroy()
 
 ## The tile's texture on `device`, pinned for the current epoch; a tile kept
 ## only in RAM is uploaded again first (its RAM copy stays, so evicting it

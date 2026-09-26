@@ -18,7 +18,7 @@
 
 import gpu
 import memory
-from luce_canvas.tiles import Tiles, tile_size, min_u32, tile_texture
+from luce_canvas.tiles import Tiles, tile_size, min_u32, tile_texture, transient_mark, release_transients
 from luce_canvas.cache import TileCache
 from luce_canvas.shaders import halve_frag_words, halve_frag_msl
 from luce_canvas.half import from_half
@@ -53,6 +53,14 @@ pub struct Pyramid:
     pub mutating func texture(tiles: const Tiles*, column: u32, row: u32, level: u32, mask: bool = false) -> gpu.Texture?!:
         return try self.level_tile(tiles, column, row, level, mask, true)
 
+    ## As `texture`, for one pass making a derived tile: at level 0 a tile kept
+    ## in RAM gets a transient upload (see `Tiles.pass_texture`) the caller
+    ## releases once its pass is submitted.
+    pub mutating func pass_texture(tiles: const Tiles*, column: u32, row: u32, level: u32, mask: bool = false) -> gpu.Texture?!:
+        if level == 0:
+            return try tiles.pass_texture(column, row)
+        return try self.level_tile(tiles, column, row, level, mask, true)
+
     ## `texture`, `wanted` for itself or only on the way to a coarser tile. A
     ## tile made on the way is kept as least wanted, so building one coarse tile
     ## (a level-4 tile makes 84 finer ones) does not push out the coarse tiles
@@ -67,7 +75,10 @@ pub struct Pyramid:
             return none
         if let found = self.cache.find(key):
             return found
-        # The four finer tiles first, all held, then one pass over them.
+        # The four finer tiles first, all held, then one pass over them; level-0
+        # parts kept in RAM come up for this pass alone.
+        let mark = transient_mark()
+        defer release_transients(mark)
         var parts: gpu.Texture[4]
         var present: bool[4] = [false, false, false, false]
         var covered: u32[8]
@@ -75,7 +86,8 @@ pub struct Pyramid:
             let fine_column = column * 2 + (u32)(quarter % 2)
             let fine_row = row * 2 + (u32)(quarter // 2)
             if cell_exists(tiles, fine_column, fine_row, level - 1):
-                if let part = try self.level_tile(tiles, fine_column, fine_row, level - 1, mask, false):
+                let found = (try tiles.pass_texture(fine_column, fine_row)) if level == 1 else (try self.level_tile(tiles, fine_column, fine_row, level - 1, mask, false))
+                if let part = found:
                     parts[quarter] = part
                     present[quarter] = true
                 covered[quarter * 2] = covered_at(tiles.width(), fine_column, level - 1)
