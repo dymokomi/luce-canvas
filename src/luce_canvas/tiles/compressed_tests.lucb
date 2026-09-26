@@ -1,0 +1,141 @@
+# The compressed tier, with a test codec: runs of equal 8-byte texels, as
+# (texel, count) records. A one-color tile packs to 12 bytes; noise does not pack.
+
+func runs_encode(context: void*?, texels: const u8[], into: u8[]) -> usize!:
+    discard(context)
+    var at: usize = 0
+    var written: usize = 0
+    while at < texels.length:
+        var run: u32 = 1
+        while at + (usize)run * 8 < texels.length and run < 0xffffffff:
+            var same = true
+            for index in 0..<(usize)8:
+                if texels[at + (usize)run * 8 + index] != texels[at + index]:
+                    same = false
+                    break
+            if not same:
+                break
+            run += 1
+        if written + 12 > into.length:
+            # Past the bound: tell the tier it does not pay.
+            return into.length
+        for index in 0..<(usize)8:
+            into[written + index] = texels[at + index]
+        into[written + 8] = (u8)(run & 0xff)
+        into[written + 9] = (u8)((run >> 8) & 0xff)
+        into[written + 10] = (u8)((run >> 16) & 0xff)
+        into[written + 11] = (u8)(run >> 24)
+        written += 12
+        at += (usize)run * 8
+    return written
+
+func runs_decode(context: void*?, packed: const u8[], rows: u32, into: u8[]) -> !:
+    discard(context)
+    discard(rows)
+    var at: usize = 0
+    var out: usize = 0
+    while at + 12 <= packed.length:
+        let run = (u32)packed[at + 8] | ((u32)packed[at + 9] << 8) | ((u32)packed[at + 10] << 16) | ((u32)packed[at + 11] << 24)
+        for count in 0..<(usize)run:
+            if out + 8 > into.length:
+                error(invalid, "a run went past its tile")
+            for index in 0..<(usize)8:
+                into[out + index] = packed[at + index]
+            out += 8
+            discard(count)
+        at += 12
+    if out != into.length:
+        error(invalid, "a packed tile came back short")
+
+## A 1024 by 512 layer: its first cell noise, every other cell one color of its own.
+func patched_layer(device: gpu.Device) -> Tiles!:
+    var tiles = try Tiles.create(device, 1024, 512)
+    errdefer tiles.destroy()
+    let count = (usize)1024 * 512 * 4
+    let pixels = try alloc f32[count] in memory.heap
+    defer free(pixels) in memory.heap
+    var noise: u32 = 12345
+    for y in 0..<(usize)512:
+        for x in 0..<(usize)1024:
+            let at = (y * 1024 + x) * 4
+            let cell = (y // 256) * 4 + x // 256
+            if cell == 0:
+                noise = noise *% 1103515245 +% 12345
+                pixels[at] = (f32)(noise >> 16 & 0xffff) / 65535.0
+                pixels[at + 1] = (f32)(noise & 0xffff) / 65535.0
+            else:
+                pixels[at] = (f32)cell / 8.0
+                pixels[at + 1] = 0.5
+            pixels[at + 2] = 0.25
+            pixels[at + 3] = 1.0
+    try tiles.write(pixels)
+    return tiles
+
+test "tiles past the RAM budget pack in RAM, go to the scratch file compressed, and read back the same":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    defer residency_budgets(0, 0)
+    residency_codec(none, runs_encode, runs_decode, tile_bytes * 2)
+    defer clear_codec()
+    var tiles = try patched_layer(device)
+    defer tiles.destroy()
+    let before = try read_all(&tiles)
+    defer free(before) in memory.heap
+    residency_budgets(tile_bytes, tile_bytes * 2)
+    residency_advance()
+    let packs = residency_report().packs
+    try residency_settle(device)
+    # The one-color cells packed, and went to their slots packed (a few bytes each).
+    assert(residency_report().packs > packs)
+    var packed_slots: usize = 0
+    for cell in tiles.cells:
+        if let tile = cell:
+            if tile.disk >= 0 and tile.disk_length > 0:
+                packed_slots += 1
+                assert(tile.disk_length == 12)
+    assert(packed_slots > 0)
+    # The noise cell did not pay: it is marked and went whole.
+    let noisy = tiles.tile(0, 0) else trap("a painted cell")
+    assert(noisy.raw_only)
+    # Everything reads back exactly.
+    let after = try read_all(&tiles)
+    defer free(after) in memory.heap
+    assert(same_samples(before, after))
+
+test "packing keeps only the compressed copy in RAM, and unpacking many brings each back":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    defer residency_budgets(0, 0)
+    residency_codec(none, runs_encode, runs_decode, tile_bytes * 2)
+    defer clear_codec()
+    var tiles = try patched_layer(device)
+    defer tiles.destroy()
+    let before = try read_all(&tiles)
+    defer free(before) in memory.heap
+    # Every cell to RAM (a readback), then off the GPU.
+    var list: Tile*[8] = ---
+    var count: usize = 0
+    for cell in tiles.cells:
+        if let tile = cell:
+            list[count] = tile
+            count += 1
+    residency_advance()
+    discard(try demote(device, list[..<count]))
+    let held = packed_tile_bytes
+    let freed = try pack_many(list[..<count])
+    # Seven one-color cells of 12 bytes each; the noise cell keeps its whole copy.
+    assert(freed == (tile_bytes - 12) * 7 and packed_tile_bytes == held + 12 * 7)
+    assert(list[0].ram.length == tile_bytes and list[1].ram.length == 0 and list[1].packed.length == 12)
+    try unpack_many(list[1..<count])
+    let after = try read_all(&tiles)
+    defer free(after) in memory.heap
+    assert(same_samples(before, after))
+
+func clear_codec():
+    codec_encode = none
+    codec_decode = none
+    codec_bound = 0

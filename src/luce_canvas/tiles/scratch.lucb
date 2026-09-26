@@ -217,6 +217,51 @@ func spill(tile: Tile*) -> !:
     drop_ram_copy(tile)
     residency_spills += 1
 
+## Move `tile`'s compressed copy to the scratch file: only its compressed
+## bytes are written, into a slot of a whole tile's size (the free list stays
+## one kind of slot); the RAM it held is freed. The document file holding it
+## means nothing need be written.
+func spill_packed(tile: Tile*) -> !:
+    if tile.packed.length == 0:
+        return
+    if tile.disk < 0 and not backed(tile):
+        let file = try scratch_file()
+        let offset = try take_slot()
+        errdefer try_give_slot(offset)
+        discard(try file.seek(offset))
+        var written: usize = 0
+        while written < tile.packed.length:
+            let count = try file.write(tile.packed[written..])
+            if count == 0:
+                error(invalid, "the scratch file took no more bytes")
+            written += count
+        tile.disk = offset
+        tile.disk_length = (u32)tile.packed.length
+        disk_tile_bytes += tile_bytes
+    drop_packed(tile)
+    residency_spills += 1
+
+## Bring a tile whose slot holds it compressed back into RAM, decoded; the slot stays.
+func load_packed_slot(tile: Tile*) -> !:
+    let decode = codec_decode else error(invalid, "a compressed tile came back without a codec")
+    let file = try scratch_file()
+    let packed = try alloc u8[(usize)tile.disk_length] in memory.heap
+    defer free(packed) in memory.heap
+    discard(try file.seek(tile.disk))
+    var read: usize = 0
+    while read < packed.length:
+        let count = try file.read(packed[read..])
+        if count == 0:
+            error(invalid, "the scratch file ended inside a tile")
+        read += count
+    let copy = try alloc u8[tile_bytes] in memory.heap
+    errdefer free(copy) in memory.heap
+    memory.set(copy, 0)
+    try decode(codec_context, packed, tile_size, copy)
+    tile.ram = copy
+    ram_tile_bytes += tile_bytes
+    residency_loads += 1
+
 func try_give_slot(offset: i64):
     give_slot(offset) catch failure:
         discard(failure)
@@ -226,8 +271,14 @@ func try_give_slot(offset: i64):
 func ensure_ram(tile: Tile*) -> !:
     if tile.ram.length > 0:
         return
+    if tile.packed.length > 0:
+        try unpack(tile)
+        return
     if tile.disk < 0:
         try fetch_backed(tile)
+        return
+    if tile.disk_length > 0:
+        try load_packed_slot(tile)
         return
     let file = try scratch_file()
     let copy = try alloc u8[tile_bytes] in memory.heap
@@ -249,4 +300,5 @@ func release_disk(tile: Tile*):
         return
     try_give_slot(tile.disk)
     tile.disk = -1
+    tile.disk_length = 0
     disk_tile_bytes -= tile_bytes

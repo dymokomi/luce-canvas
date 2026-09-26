@@ -3,7 +3,9 @@ reading.lucb
 residency.lucb
 scratch.lucb
 backing.lucb
+compressed.lucb
 governor.lucb
 residency_tests.lucb
+compressed_tests.lucb
 scratch_tests.lucb
 tests.lucb

@@ -33,8 +33,9 @@ var last_tile: Tile*? = none
 ## A new tile holding `texture` (taken over), on the GPU, held once.
 func make_tile(texture: gpu.Texture) -> Tile*!:
     var no_ram: u8[]
+    var no_packed: u8[]
     let tile = try new Tile(texture = texture, on_gpu = true, ram = no_ram, references = 1, stamp = next_stamp(), used = residency_epoch, live = 0,
-                            disk = -1, source = none, source_offset = 0, source_length = 0, source_rows = 0, previous = last_tile, next = none) in memory.heap
+                            disk = -1, disk_length = 0, packed = no_packed, raw_only = false, source = none, source_offset = 0, source_length = 0, source_rows = 0, previous = last_tile, next = none) in memory.heap
     if let last = last_tile:
         last.next = tile
     else:
@@ -49,6 +50,7 @@ func make_tile(texture: gpu.Texture) -> Tile*!:
 func forget_tile(tile: Tile*):
     drop_gpu_copy(tile)
     drop_ram_copy(tile)
+    drop_packed(tile)
     release_disk(tile)
     release_backing(tile)
     if let previous = tile.previous:
@@ -203,8 +205,9 @@ func demote(device: gpu.Device, tiles: Tile*[]) -> usize!:
             at += 1
             if not tile.on_gpu or tile.used == residency_epoch:
                 continue
-            # A copy in RAM, or in the document file: nothing to read back.
-            if tile.ram.length > 0 or backed(tile):
+            # A copy in RAM (whole or compressed), in a slot or in the document file:
+            # nothing to read back.
+            if tile.ram.length > 0 or tile.packed.length > 0 or tile.disk >= 0 or backed(tile):
                 drop_gpu_copy(tile)
                 residency_demotions += 1
                 freed += tile_bytes

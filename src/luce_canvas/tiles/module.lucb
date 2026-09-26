@@ -40,6 +40,13 @@ pub struct Tile:
     var live: u64
     ## Its slot in the scratch file (tiles/scratch), or -1 when it has none.
     var disk: i64
+    ## How many bytes of the slot hold it compressed; 0 when the slot holds it whole.
+    var disk_length: u32
+    ## Its content compressed in RAM by the application's tile codec
+    ## (tiles/compressed), or empty.
+    var packed: u8[]
+    ## The codec found it did not pay to compress: it goes to disk whole.
+    var raw_only: bool
     ## The document file record that also holds it (tiles/backing), if any:
     ## such a tile leaves the GPU and RAM without being written anywhere.
     var source: TileSource*?
@@ -245,10 +252,12 @@ pub struct Tiles:
         if tile.references != 1:
             error(invalid, "a shared tile cannot be redrawn")
         tile.stamp = next_stamp()
-        # The file no longer holds what it shows.
+        # The file no longer holds what it shows, nor do a compressed copy or a slot.
         release_backing(tile)
+        tile.raw_only = false
         if tile.on_gpu:
             drop_ram_copy(tile)
+            drop_packed(tile)
             release_disk(tile)
 
     ## Make a cell transparent again.
