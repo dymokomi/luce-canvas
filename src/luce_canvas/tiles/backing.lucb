@@ -28,14 +28,18 @@ pub struct TileSource:
     ## Where the file is, to know a save over it.
     var path: str
 
-## Open `path` as a source of tiles decoded by `decode` (with `context`). The
-## caller holds one reference and lets it go with `release_tile_source`.
-pub func open_tile_source(path: str, context: void*?, decode: TileDecode) -> TileSource*!:
+## Open `path` as a source of tiles decoded by `decode` (with `context`),
+## known as `name` ("" for `path`): a file written beside its place and then
+## renamed into it is opened before the rename, under the name it will have.
+## The caller holds one reference and lets it go with `release_tile_source`.
+pub func open_tile_source(path: str, context: void*?, decode: TileDecode, name: str = "") -> TileSource*!:
     let native = try strings.copy(path)
-    errdefer strings.release(native)
+    defer strings.release(native)
     var file = try files.File.open((c.str)native)
     errdefer file.destroy()
-    return try new TileSource(file = file, references = 1, context = context, decode = decode, path = native) in memory.heap
+    let known = try strings.copy(name if name.length > 0 else path)
+    errdefer strings.release(known)
+    return try new TileSource(file = file, references = 1, context = context, decode = decode, path = known) in memory.heap
 
 ## Let go of one hold on `source`; the last closes the file.
 pub func release_tile_source(source: TileSource*):
