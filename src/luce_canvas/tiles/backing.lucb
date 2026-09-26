@@ -113,8 +113,11 @@ func fetch_many(tiles: Tile*[]) -> !:
     if count == 0:
         return
     let jobs = try alloc FetchJob[count] in memory.heap
+    # Only the jobs written so far are freed: a read that fails part way
+    # leaves the rest of `jobs` as `alloc` gave it.
+    var written: usize = 0
     defer:
-        for index in 0..<jobs.length:
+        for index in 0..<written:
             if jobs[index].packed.length > 0:
                 free(jobs[index].packed) in memory.heap
             if jobs[index].copy.length > 0:
@@ -127,6 +130,7 @@ func fetch_many(tiles: Tile*[]) -> !:
         let source = tile.source else trap("backed")
         var no_bytes: u8[]
         jobs[at] = FetchJob(tile = tile, packed = no_bytes, copy = no_bytes, failed = false)
+        written = at + 1
         jobs[at].packed = try alloc u8[(usize)tile.source_length] in memory.heap
         jobs[at].copy = try alloc u8[tile_bytes] in memory.heap
         memory.set(jobs[at].copy, 0)
