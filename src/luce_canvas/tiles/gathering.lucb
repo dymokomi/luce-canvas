@@ -54,7 +54,9 @@ func load_packed_slots(list: Tile*[]) -> !:
     if list.length == 0:
         return
     let file = try scratch_file()
-    defer drop_all_packed(list)
+    defer:
+        for tile in list:
+            drop_packed(tile)
     for tile in list:
         let packed = try alloc u8[(usize)tile.disk_length] in memory.heap
         tile.packed = packed
@@ -67,10 +69,6 @@ func load_packed_slots(list: Tile*[]) -> !:
                 error(invalid, "the scratch file ended inside a tile")
             read += count
     try unpack_many(list)
-
-func drop_all_packed(list: Tile*[]):
-    for tile in list:
-        drop_packed(tile)
 
 ## Tiles from any stores to bring back into RAM together: each added one
 ## that is only somewhere slower waits, and every 64 go back as one batch.

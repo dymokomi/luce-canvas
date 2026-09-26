@@ -105,7 +105,6 @@ func read_record(source: TileSource*, offset: u64, into: u8[]) -> !:
 ## records read in order, then decoded across the processors (a read of many
 ## cells would otherwise decode them one by one).
 func fetch_many(tiles: Tile*[]) -> !:
-    var jobs: FetchJob[] = none_jobs()
     var count: usize = 0
     for tile in tiles:
         if tile.on_gpu or tile.ram.length > 0 or tile.disk >= 0 or tile.source == none:
@@ -113,8 +112,14 @@ func fetch_many(tiles: Tile*[]) -> !:
         count += 1
     if count == 0:
         return
-    jobs = try alloc FetchJob[count] in memory.heap
-    defer release_jobs(jobs)
+    let jobs = try alloc FetchJob[count] in memory.heap
+    defer:
+        for index in 0..<jobs.length:
+            if jobs[index].packed.length > 0:
+                free(jobs[index].packed) in memory.heap
+            if jobs[index].copy.length > 0:
+                free(jobs[index].copy) in memory.heap
+        free(jobs) in memory.heap
     var at: usize = 0
     for tile in tiles:
         if tile.on_gpu or tile.ram.length > 0 or tile.disk >= 0 or tile.source == none:
@@ -145,18 +150,6 @@ struct FetchJob:
     var packed: u8[]
     var copy: u8[]
     var failed: bool
-
-func none_jobs() -> FetchJob[]:
-    var nothing: FetchJob[]
-    return nothing
-
-func release_jobs(jobs: FetchJob[]):
-    for index in 0..<jobs.length:
-        if jobs[index].packed.length > 0:
-            free(jobs[index].packed) in memory.heap
-        if jobs[index].copy.length > 0:
-            free(jobs[index].copy) in memory.heap
-    free(jobs) in memory.heap
 
 ## A share of the jobs for one worker.
 struct FetchShare:
