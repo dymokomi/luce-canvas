@@ -13,6 +13,7 @@ import memory
 import os
 import paths
 import platform
+import strings
 import thread
 from luce_canvas.half import to_half, from_half
 from raster_errors import invalid, limit

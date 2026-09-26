@@ -9,8 +9,11 @@
 #       and read back when the tile is wanted again, which leaves the slot in place so moving
 #       it out once more costs nothing. A slot freed with its tile goes on a free list and is
 #       used again before the file grows. The file is made the first time it is needed, in a
-#       fresh directory under the system's temporary one; on macOS and Linux its name is
-#       removed at once, so nothing is left behind whatever way the process ends.
+#       fresh directory under the scratch directory (`set_scratch_directory`, else a disk-backed
+#       default: on Linux the user's cache, since /tmp is often RAM-backed tmpfs there, which
+#       would put the spilled tiles back in memory; elsewhere the system's temporary one). On
+#       macOS and Linux its name is removed at once, so nothing is left behind whatever way the
+#       process ends.
 #
 #==============================================================================================
 
@@ -24,6 +27,41 @@ var disk_tile_bytes: usize = 0
 var residency_spills: u64 = 0
 var residency_loads: u64 = 0
 
+## The scratch directory the application chose; empty for the default.
+var chosen_root: str = ""
+
+## Keep scratch files in `directory` (which must exist); "" for the default. It
+## applies to a scratch file not yet made: one already open stays where it is.
+pub func set_scratch_directory(directory: str) -> !:
+    let copied = try strings.copy(directory)
+    if chosen_root.length > 0:
+        strings.release(chosen_root)
+    chosen_root = copied
+
+## The directory scratch files go in: the chosen one, else a disk-backed default.
+func scratch_root() -> str!:
+    if chosen_root.length > 0:
+        return chosen_root
+    if platform.linux:
+        return try linux_cache_root()
+    else:
+        return temporary_root()
+
+## Linux: $XDG_CACHE_HOME/luce, else ~/.cache/luce, made if missing; /tmp when
+## there is no home at all.
+func linux_cache_root() -> str!:
+    var cache = ""
+    if let chosen = os.env((c.str)"XDG_CACHE_HOME"):
+        cache = chosen
+    elif let home = os.env((c.str)"HOME"):
+        cache = try paths.join(home, ".cache")
+        try files.ensure_directory(cache)
+    else:
+        return temporary_root()
+    let root = try paths.join(cache, "luce")
+    try files.ensure_directory(root)
+    return root
+
 ## The directory temporary files go in: TMPDIR or TEMP, else /tmp.
 func temporary_root() -> str:
     if let chosen = os.env((c.str)"TMPDIR"):
@@ -36,7 +74,7 @@ func temporary_root() -> str:
 func scratch_file() -> files.File*!:
     if let open = scratch:
         return open
-    let directory = try files.create_temporary_directory((c.str)temporary_root())
+    let directory = try files.create_temporary_directory((c.str)(try scratch_root()))
     let path = try paths.join(directory, "tiles.scratch")
     var opened = try files.File.open((c.str)path, files.OpenMode.create_new_read_write, permissions = 384)
     errdefer opened.destroy()
