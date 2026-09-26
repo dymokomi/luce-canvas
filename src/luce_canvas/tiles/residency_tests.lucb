@@ -316,3 +316,12 @@ test "a tile from the scratch file drawn into in place lets its slot go, so it n
     let after = try read_all(&tiles)
     defer free(after) in memory.heap
     assert(after[((10 * 1024) + 512 + 10) * 4 + 3] == 0.0)
+
+test "the process's memory is told where the system can tell it, and never past the machine's":
+    let held = process_memory()
+    if platform.macos or platform.windows or platform.linux:
+        assert(held > 0)
+    let machine = physical_memory()
+    if machine > 0:
+        assert((u64)held <= machine)
+    assert(residency_report().process >= held // 2)

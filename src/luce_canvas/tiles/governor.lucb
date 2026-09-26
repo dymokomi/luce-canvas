@@ -32,6 +32,10 @@
 #       the least wanted tiles kept only in RAM (history's first) move to the scratch file
 #       (tiles/scratch), from which they come back when wanted. On unified memory (Apple
 #       silicon, an integrated GPU) the GPU's tiles are RAM as well, and count against it.
+#       The RAM budget is the process's: where the system reports what the process holds
+#       (macOS its footprint, Windows its private bytes, Linux its resident pages) that
+#       counts when it is more than the tiles alone, since a driver's own copies of GPU memory
+#       and everything else the application holds take the same RAM.
 #       Not yet: compressed RAM (the design's C tier).
 #
 #==============================================================================================
@@ -77,6 +81,8 @@ pub struct ResidencyReport:
     pub var disk_tiles: usize
     pub var spills: u64
     pub var loads: u64
+    ## What the system says the process holds; 0 where it cannot tell.
+    pub var process: usize
 
 # mark: The governor's controls (one set per process; tiles live on the main thread) ==========
 
@@ -116,7 +122,14 @@ pub func residency_frame(serial: u64) -> bool:
 ## Whether the GPU tiers hold more than their budget: then the editor marks
 ## what its documents show and settles.
 pub func residency_over_budget() -> bool:
-    return (gpu_budget > 0 and gpu_tile_bytes + derived_tile_bytes > gpu_budget) or (ram_budget > 0 and ram_held() > ram_budget)
+    return (gpu_budget > 0 and gpu_tile_bytes + derived_tile_bytes > gpu_budget) or (ram_budget > 0 and ram_pressure() > ram_budget)
+
+## What counts against the RAM budget: the tiles' RAM (`ram_held`), or what the
+## system says the whole process holds when that is more.
+func ram_pressure() -> usize:
+    let held = ram_held()
+    let process = process_memory()
+    return process if process > held else held
 
 ## What counts against the RAM budget: RAM copies, and on unified memory the
 ## GPU's tiles too.
@@ -152,11 +165,20 @@ pub func residency_settle(device: gpu.Device) -> !:
                 cache_scale_now = max_f64(0.25, cache_scale_now * 0.5)
         elif held < gpu_budget // 10 * 6:
             cache_scale_now = min_f64(1.0, cache_scale_now * 1.25)
-    if ram_budget > 0 and ram_held() > ram_budget:
-        let target = ram_budget // 100 * 85
-        drop_warm_copies(ram_held() - target)
-        if ram_held() > target:
-            try spill_ram(ram_held() - target)
+    if ram_budget > 0:
+        let pressure = ram_pressure()
+        if pressure > ram_budget:
+            # Past the budget by the tiles' own count, settle to 85% of it; by what
+            # the process holds beyond the tiles, only back to the budget: memory
+            # freed may stay with the allocator a while, and asking the process
+            # figure for more each time would move every tile out.
+            let held = ram_held()
+            let target = ram_budget // 100 * 85 if held > ram_budget else ram_budget // 100 * 95
+            var wanted = pressure - target
+            let dropped = drop_warm_copies(wanted)
+            wanted = wanted - dropped if dropped < wanted else 0
+            if wanted > 0:
+                discard(try spill_ram(wanted))
 
 ## The share of their budgets derived caches may keep now.
 pub func residency_cache_scale() -> f64:
@@ -176,7 +198,7 @@ pub func residency_fail_allocations(count: usize):
 pub func residency_report() -> ResidencyReport:
     return ResidencyReport(gpu_tiles = gpu_tile_bytes, ram_tiles = ram_tile_bytes, derived = derived_tile_bytes, gpu_budget = gpu_budget, ram_budget = ram_budget,
                            promotions = residency_promotions, demotions = residency_demotions, transient_uploads = residency_transient_uploads,
-                           disk_tiles = disk_tile_bytes, spills = residency_spills, loads = residency_loads)
+                           disk_tiles = disk_tile_bytes, spills = residency_spills, loads = residency_loads, process = process_memory())
 
 ## The device is out of memory: shrink derived caches and move unpinned tiles
 ## to RAM, `wanted` bytes' worth, least wanted first. Bytes freed.
@@ -302,22 +324,73 @@ func spill_ram(wanted: usize) -> usize!:
 
 ## Free RAM copies of tiles that are also on the GPU, the least recently used
 ## first, until `wanted` bytes are gone or none is left.
-func drop_warm_copies(wanted: usize):
+func drop_warm_copies(wanted: usize) -> usize:
     var freed: usize = 0
     var cursor = first_tile
     while let tile = cursor:
         if freed >= wanted:
-            return
+            return freed
         cursor = tile.next
         if tile.on_gpu and tile.ram.length > 0:
             drop_ram_copy(tile)
             freed += tile_bytes
+    return freed
 
 # mark: The machine's memory ==================================================================
 
 extern func sysctlbyname(name: c.str, value: void*, length: usize*, new_value: void*?, new_length: usize) -> i32
 extern func sysconf(name: i32) -> i64
 extern func GlobalMemoryStatusEx(status: void*) -> i32
+extern func proc_pid_rusage(pid: i32, flavor: i32, buffer: void*) -> i32
+extern func getpid() -> i32
+extern func GetCurrentProcess() -> void*
+extern func K32GetProcessMemoryInfo(process: void*, counters: void*, size: u32) -> i32
+
+## What the system says this process holds in bytes; 0 when it cannot tell.
+## macOS: the physical footprint (what Activity Monitor shows); Windows: private
+## bytes; Linux: resident pages.
+pub func process_memory() -> usize:
+    if platform.macos:
+        # rusage_info_v2: a 16-byte UUID, then u64s; ri_phys_footprint is the 8th.
+        var info: u64[32]
+        memory.set(u8[]((u8*)&info[0], 256), 0)
+        if proc_pid_rusage(getpid(), 2, (void*)&info[0]) != 0:
+            return 0
+        return (usize)info[9]
+    elif platform.windows:
+        # PROCESS_MEMORY_COUNTERS_EX: cb, PageFaultCount, then SIZE_Ts; PrivateUsage at byte 72.
+        var counters: u64[10]
+        memory.set(u8[]((u8*)&counters[0], 80), 0)
+        counters[0] = 80
+        if K32GetProcessMemoryInfo(GetCurrentProcess(), (void*)&counters[0], 80) == 0:
+            return 0
+        return (usize)counters[9]
+    else:
+        return linux_resident()
+
+## Linux: the resident pages /proc/self/statm gives second, as bytes.
+func linux_resident() -> usize:
+    var opened = files.File.open((c.str)"/proc/self/statm", files.OpenMode.read) catch failure:
+        discard(failure)
+        return 0
+    defer opened.destroy()
+    var text: u8[128]
+    let count = opened.read(text) catch failure:
+        discard(failure)
+        return 0
+    var field: usize = 0
+    var value: usize = 0
+    for index in 0..<count:
+        let character = text[index]
+        if character == ' ':
+            if field == 1:
+                break
+            field += 1
+            value = 0
+        elif character >= '0' and character <= '9' and field == 1:
+            value = value * 10 + (usize)(character - '0')
+    let size = sysconf(30)
+    return value * (usize)size if size > 0 else 0
 
 ## The machine's physical memory in bytes; 0 when it cannot be told.
 func physical_memory() -> u64:
