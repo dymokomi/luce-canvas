@@ -106,6 +106,17 @@ pub struct TileCache:
         self.held_bytes += bytes
         residency_derived(bytes, true)
 
+    ## Drop the tile kept for `key`, if any: one about to be made again from
+    ## changed tiles, which would only take room until it was pushed out. One a
+    ## request still holds stays, first to go.
+    pub mutating func forget(key: u64):
+        let slot = self.map.find(key) else return
+        let at = (usize)slot
+        if self.entries[at].used >= self.guard:
+            self.entries[at].recent = false
+            return
+        self.drop(at)
+
     ## Drop entries (unheld, least recently wanted first) until `bytes` more
     ## fit: every ordinary tile before any precious one, and precious tiles only
     ## while they alone are over the budget. Each sweep is bounded: at most two

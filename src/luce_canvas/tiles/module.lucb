@@ -307,23 +307,19 @@ pub struct Tiles:
     ## the last), the document's width. What a picture loads through a band at a
     ## time, never whole.
     pub mutating func write_band(row: u32, pixels: const f32[]) -> !:
-        let rows = (usize)min_u32(tile_size, self.extent_y - row * tile_size)
-        if row >= self.cell_rows or pixels.length != (usize)self.extent_x * rows * 4:
-            error(invalid, "a band holds its row of cells' pixel rows, the document's width")
-        let columns = (usize)self.cell_columns
-        let per_tile = (usize)tile_size * (usize)tile_size * 8
-        let band = try alloc u8[columns * per_tile] in memory.heap
+        let band = try alloc u8[packed_band_bytes(self.extent_x)] in memory.heap
         defer free(band) in memory.heap
-        let painted = try alloc bool[columns] in memory.heap
+        let painted = try alloc bool[(usize)self.cell_columns] in memory.heap
         defer free(painted) in memory.heap
-        try self.write_cells_of(row, pixels, (usize)row * (usize)tile_size, band, painted)
+        try pack_band(self.extent_x, self.extent_y, row, pixels, band, painted)
+        try self.write_packed(row, band, painted)
 
-    ## Row `row` of cells from `pixels`, whose first row is document row `origin`.
-    mutating func write_cells_of(row: u32, pixels: const f32[], origin: usize, band: u8[], painted: bool[]) -> !:
-        let columns = (usize)self.cell_columns
+    ## Replace row `row` of cells with the tiles `pack_band` made: each painted
+    ## one uploaded, the others cleared. The GPU half of `write_band`.
+    pub mutating func write_packed(row: u32, band: const u8[], painted: const bool[]) -> !:
         let per_tile = (usize)tile_size * (usize)tile_size * 8
-        var job = WriteJob(pixels = pixels, band = band, painted = painted, extent_x = self.extent_x, extent_y = self.extent_y, row = row, origin = origin, first = 0, last = columns)
-        try run_bands(&job, columns)
+        if row >= self.cell_rows or band.length < (usize)self.cell_columns * per_tile or painted.length < (usize)self.cell_columns:
+            error(invalid, "a packed band holds a tile for each of its row's cells")
         for column in 0..<self.cell_columns:
             if not painted[(usize)column]:
                 try self.clear(column, row)
@@ -333,6 +329,13 @@ pub struct Tiles:
             let at = (usize)column * per_tile
             try texture.upload(band[at..<at + per_tile])
             try self.set(column, row, texture)
+
+    ## Row `row` of cells from `pixels`, whose first row is document row `origin`.
+    mutating func write_cells_of(row: u32, pixels: const f32[], origin: usize, band: u8[], painted: bool[]) -> !:
+        let columns = (usize)self.cell_columns
+        var job = WriteJob(pixels = pixels, band = band, painted = painted, extent_x = self.extent_x, extent_y = self.extent_y, row = row, origin = origin, first = 0, last = columns)
+        try run_bands(&job, columns)
+        try self.write_packed(row, band, painted)
 
     ## Replace cell (`column`, `row`) with `pixels`, one cell's premultiplied
     ## RGBA f32 samples, 256 rows of 256 whatever the cell's size (past the
@@ -663,9 +666,6 @@ struct WriteJob:
     var first: usize
     var last: usize
 
-func write_entry(context: void*?):
-    write_cells((WriteJob*)(context else return))
-
 func write_cells(job: WriteJob*):
     let per_tile = (usize)tile_size * (usize)tile_size * 8
     let top = (usize)job.row * (usize)tile_size
@@ -693,27 +693,14 @@ func write_cells(job: WriteJob*):
 
 ## `job`'s cells split over the processors, this thread taking the first share.
 func run_bands(job: WriteJob*, count: usize) -> !:
-    let workers = min_usize(16, min_usize(count, max_usize(1, (usize)os.cpus())))
-    if workers <= 1:
-        write_cells(job)
-        return
-    var shares: WriteJob[16]
-    var handles: thread.Handle[16]
-    var started: usize = 0
-    let per = (count + workers - 1) // workers
-    for share in 0..<workers:
-        shares[share] = *job
-        shares[share].first = min_usize(count, share * per)
-        shares[share].last = min_usize(count, share * per + per)
-    for share in 1..<workers:
-        handles[started] = thread.spawn(write_entry, (void*)&shares[share], name = "tiles-write") catch failure:
-            for other in share..<workers:
-                write_cells(&shares[other])
-            break
-        started += 1
-    write_cells(&shares[0])
-    for index in 0..<started:
-        try handles[index].join()
+    try run_shares(count, write_share, (void*)job)
+
+## `write_cells` over cells `first..<last` of the job.
+func write_share(context: void*?, first: usize, last: usize):
+    var share = *(WriteJob*)(context else return)
+    share.first = first
+    share.last = last
+    write_cells(&share)
 
 func min_usize(a: usize, b: usize) -> usize:
     return a if a < b else b

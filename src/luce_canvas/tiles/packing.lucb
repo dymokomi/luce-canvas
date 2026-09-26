@@ -1,0 +1,130 @@
+#==============================================================================================
+#
+#   tiles/packing - Rows of pixels packed into a row of tiles' bytes, on any thread
+#
+#   DESCRIPTION:
+#       A picture loads a band of 256 rows at a time. Packing a band into half-float tiles
+#       is CPU work that needs no device, so a decoder's worker does it while the main
+#       thread uploads the band before (`Tiles.write_packed`). Samples come as linear f32
+#       (`pack_band`) or, for 8 and 16-bit pictures, as their encoded values through
+#       tables of each code's half float (`pack_band_coded`): a lookup a sample rather
+#       than a conversion, which is what keeps up with the decoder.
+#
+#==============================================================================================
+
+## Bytes a packed band takes for a document `extent_x` wide: a tile a column.
+pub func packed_band_bytes(extent_x: u32) -> usize:
+    return (usize)tile_columns(extent_x) * (usize)tile_size * (usize)tile_size * 8
+
+## Row `row` of cells of an `extent_x` by `extent_y` document as half-float
+## tiles in `band` (`packed_band_bytes`), and in `painted` which hold anything,
+## from `pixels`: straight-alpha linear RGBA f32 of just that row's pixel rows.
+pub func pack_band(extent_x: u32, extent_y: u32, row: u32, pixels: const f32[], band: u8[], painted: bool[]) -> !:
+    let rows = try band_rows(extent_x, extent_y, row, band, painted)
+    if pixels.length != (usize)extent_x * rows * 4:
+        error(invalid, "a band holds its row of cells' pixel rows, the document's width")
+    let columns = (usize)tile_columns(extent_x)
+    var job = WriteJob(pixels = pixels, band = band, painted = painted, extent_x = extent_x, extent_y = extent_y, row = row, origin = (usize)row * (usize)tile_size, first = 0, last = columns)
+    try run_bands(&job, columns)
+
+## `pack_band` from encoded RGBA samples, 8-bit (`deep` false) or native 16-bit
+## (`deep`), of just that row's pixel rows: `color[code]` is the half float of a
+## red, green or blue code as linear light, `alpha[code]` of an alpha code (256
+## entries each for 8-bit samples, 65536 for 16-bit).
+pub func pack_band_coded(extent_x: u32, extent_y: u32, row: u32, samples: const u8[], deep: bool, color: const u16[], alpha: const u16[], band: u8[], painted: bool[]) -> !:
+    let rows = try band_rows(extent_x, extent_y, row, band, painted)
+    let codes: usize = 65536 if deep else 256
+    if samples.length != (usize)extent_x * rows * 4 * (2 if deep else 1) or color.length < codes or alpha.length < codes:
+        error(invalid, "a band holds its row of cells' samples, the document's width, and a table entry for every code")
+    var job = CodedJob(samples = samples, deep = deep, color = color, alpha = alpha, band = band, painted = painted, extent_x = extent_x, rows = rows)
+    try run_shares((usize)tile_columns(extent_x), coded_cells, (void*)&job)
+
+## The pixel rows row `row` of cells covers, once the band's buffers are checked.
+func band_rows(extent_x: u32, extent_y: u32, row: u32, band: const u8[], painted: const bool[]) -> usize!:
+    if row >= tile_columns(extent_y):
+        error(invalid, "a band is a row of cells within the document")
+    if band.length < packed_band_bytes(extent_x) or painted.length < (usize)tile_columns(extent_x):
+        error(invalid, "a packed band holds a tile for each of its row's cells")
+    return (usize)min_u32(tile_size, extent_y - row * tile_size)
+
+## A band of encoded samples being packed.
+struct CodedJob:
+    var samples: const u8[]
+    var deep: bool
+    var color: const u16[]
+    var alpha: const u16[]
+    var band: u8[]
+    var painted: bool[]
+    var extent_x: u32
+    var rows: usize
+
+## Cells `first..<last` of a coded job: each texel four lookups, the padding
+## past the document zero.
+func coded_cells(context: void*?, first: usize, last: usize):
+    let job = (CodedJob*)(context else return)
+    let side = (usize)tile_size
+    var words: const u16[]
+    if job.deep:
+        words = u16[]((u16*)job.samples.data, job.samples.length // 2)
+    for column in first..<last:
+        let left = column * side
+        let width = min_usize(side, (usize)job.extent_x - left)
+        let out = u16[]((u16*)&job.band[column * side * side * 8], side * side * 4)
+        var opaque = false
+        for y in 0..<side:
+            let line = out[y * side * 4..<(y + 1) * side * 4]
+            if y >= job.rows:
+                memory.set(u8[]((u8*)line.data, side * 8), 0)
+                continue
+            let source = (y * (usize)job.extent_x + left) * 4
+            for x in 0..<width:
+                let at = source + x * 4
+                let a = (usize)words[at + 3] if job.deep else (usize)job.samples[at + 3]
+                if job.deep:
+                    line[x * 4] = job.color[(usize)words[at]]
+                    line[x * 4 + 1] = job.color[(usize)words[at + 1]]
+                    line[x * 4 + 2] = job.color[(usize)words[at + 2]]
+                else:
+                    line[x * 4] = job.color[(usize)job.samples[at]]
+                    line[x * 4 + 1] = job.color[(usize)job.samples[at + 1]]
+                    line[x * 4 + 2] = job.color[(usize)job.samples[at + 2]]
+                line[x * 4 + 3] = job.alpha[a]
+                if a != 0:
+                    opaque = true
+            if width < side:
+                memory.set(u8[]((u8*)&line[width * 4], (side - width) * 8), 0)
+        job.painted[column] = opaque
+
+## `work(context, first, last)` over `0..<count` split across the processors
+## (sixteen at most), this thread taking the first share.
+func run_shares(count: usize, work: func(void*?, usize, usize) -> unit, context: void*?) -> !:
+    let workers = min_usize(16, min_usize(count, max_usize(1, (usize)os.cpus())))
+    if workers <= 1:
+        work(context, 0, count)
+        return
+    var shares: Share[16] = ---
+    var handles: thread.Handle[16]
+    var started: usize = 0
+    let per = (count + workers - 1) // workers
+    for index in 0..<workers:
+        shares[index] = Share(work = work, context = context, first = min_usize(count, index * per), last = min_usize(count, index * per + per))
+    for index in 1..<workers:
+        handles[started] = thread.spawn(share_entry, (void*)&shares[index], name = "tiles-pack") catch failure:
+            for other in index..<workers:
+                share_entry((void*)&shares[other])
+            break
+        started += 1
+    share_entry((void*)&shares[0])
+    for index in 0..<started:
+        try handles[index].join()
+
+## One thread's part of `run_shares`.
+struct Share:
+    var work: func(void*?, usize, usize) -> unit
+    var context: void*?
+    var first: usize
+    var last: usize
+
+func share_entry(context: void*?):
+    let share = (Share*)(context else return)
+    share.work(share.context, share.first, share.last)

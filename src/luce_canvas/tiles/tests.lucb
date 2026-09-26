@@ -213,3 +213,50 @@ test "writing band by band makes the same tiles as writing the whole picture":
     for index in 0..<a.length:
         assert(a[index] == b[index])
     assert(not banded.painted(0, 0) and banded.painted(1, 0))
+
+test "a band packed from encoded samples through tables matches one packed from floats":
+    # No device: packing is CPU work. 8-bit and 16-bit samples over a partial last row and column.
+    let width: usize = 600
+    let height: usize = 530
+    for deep in [false, true]:
+        let codes: usize = 65536 if deep else 256
+        let color = try alloc u16[codes] in memory.heap
+        defer free(color) in memory.heap
+        let alpha = try alloc u16[codes] in memory.heap
+        defer free(alpha) in memory.heap
+        for code in 0..<codes:
+            color[code] = to_half((f32)code / (f32)(codes - 1) * (f32)code / (f32)(codes - 1))
+            alpha[code] = to_half((f32)code / (f32)(codes - 1))
+        let columns = (usize)tile_columns((u32)width)
+        let coded = try alloc u8[packed_band_bytes((u32)width)] in memory.heap
+        defer free(coded) in memory.heap
+        let floated = try alloc u8[packed_band_bytes((u32)width)] in memory.heap
+        defer free(floated) in memory.heap
+        let coded_painted = try alloc bool[columns] in memory.heap
+        defer free(coded_painted) in memory.heap
+        let floated_painted = try alloc bool[columns] in memory.heap
+        defer free(floated_painted) in memory.heap
+        for row in 0..<tile_columns((u32)height):
+            let rows = min_usize((usize)tile_size, height - (usize)row * (usize)tile_size)
+            let samples = try alloc u8[width * rows * 4 * (2 if deep else 1)] in memory.heap
+            defer free(samples) in memory.heap
+            let pixels = try alloc f32[width * rows * 4] in memory.heap
+            defer free(pixels) in memory.heap
+            for at in 0..<width * rows * 4:
+                let x = (at // 4) % width
+                # Clear in the first column of cells.
+                var code = (at * 37 + (usize)row * 11) % codes
+                if at % 4 == 3 and x < 256:
+                    code = 0
+                if deep:
+                    u16[]((u16*)samples.data, samples.length // 2)[at] = (u16)code
+                else:
+                    samples[at] = (u8)code
+                pixels[at] = from_half(alpha[code] if at % 4 == 3 else color[code])
+            try pack_band_coded((u32)width, (u32)height, row, samples, deep, color, alpha, coded, coded_painted)
+            try pack_band((u32)width, (u32)height, row, pixels, floated, floated_painted)
+            for index in 0..<coded.length:
+                assert(coded[index] == floated[index])
+            for column in 0..<columns:
+                assert(coded_painted[column] == floated_painted[column])
+            assert(not coded_painted[0] and coded_painted[1])
