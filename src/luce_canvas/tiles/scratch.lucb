@@ -247,6 +247,11 @@ func ensure_ram(tile: Tile*) -> !:
 func release_disk(tile: Tile*):
     if tile.disk < 0:
         return
-    try_give_slot(tile.disk)
+    let slot = tile.disk
     tile.disk = -1
-    disk_tile_bytes -= tile_bytes
+    # After `release_scratch` the file and its accounting are gone; tiles an
+    # undo history or a closing document still holds are freed later.
+    if scratch == none:
+        return
+    try_give_slot(slot)
+    disk_tile_bytes -= tile_bytes if disk_tile_bytes >= tile_bytes else disk_tile_bytes

@@ -394,3 +394,20 @@ test "tiles backed by a document file leave the GPU and RAM without being writte
     assert(drawn.source == none and source.references == 8)
     release_tile_source(source)
     try files.remove_tree((c.str)folder)
+
+test "tiles on the scratch file freed after the scratch file is released do not upset the accounting":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    defer residency_budgets(0, 0)
+    var tiles = try distinct_layer(device, 0.5)
+    residency_budgets(tile_bytes, tile_bytes)
+    residency_advance()
+    try residency_settle(device)
+    assert(disk_tile_bytes > 0)
+    # A clean exit releases the scratch file while a document (an undo history)
+    # still holds tiles on it; they are freed afterwards.
+    release_scratch()
+    tiles.destroy()
+    assert(disk_tile_bytes == 0)
