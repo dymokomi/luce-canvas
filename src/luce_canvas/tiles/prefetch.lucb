@@ -156,6 +156,10 @@ func prefetch_entry(context: void*?):
             discard(failure)
             item.failed = true
     discard(batch.done.add(1, .acq_rel))
+    # The window's loop may be asleep until input (Windows waits up to a
+    # second): ask it for the frame that collects the batch.
+    window.wake() catch failure:
+        discard(failure)
 
 ## If the batch out has finished, give its tiles their decoded copies; whether
 ## any tile came back.

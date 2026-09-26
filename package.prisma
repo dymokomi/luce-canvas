@@ -1,7 +1,7 @@
 #prisma 4.0
 def package "luce-canvas" {
     str owner = "dymokomi"
-    str version = "0.1.17"
+    str version = "0.1.18"
     str kind = "package"
     str language = "luce-base"
     str description = "The canvas engine for Luce image editors: documents as immutable, shared 256-pixel GPU tiles, built to keep very large canvases fast."
@@ -39,5 +39,11 @@ def package "luce-canvas" {
         str owner = "dymokomi"
         str version = "^0.1.3"
         str path = "../luce-std"
+    }
+
+    def dependency "luce-window" {
+        str owner = "dymokomi"
+        str version = "^0.1.6"
+        str path = "../luce-window"
     }
 }
