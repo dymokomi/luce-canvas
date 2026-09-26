@@ -1,13 +1,16 @@
-## GPU-resident layer pixels, cut into 256 by 256 tiles that are immutable and
-## structurally shared: cloning a Tiles is O(tiles) pointer copies, replacing
-## one tile leaves every other one shared with the clone, and a tile's storage
-## goes when its last holder does. That sharing is what makes destructive
-## editing cheap: a stroke replaces only the tiles it touched, and history keeps
-## the old ones. Texels are straight-alpha rgba16_float in the document's
-## working space (linear light).
+## Layer pixels, cut into 256 by 256 tiles that are immutable and structurally
+## shared: cloning a Tiles is O(tiles) pointer copies, replacing one tile leaves
+## every other one shared with the clone, and a tile's storage goes when its
+## last holder does. That sharing is what makes destructive editing cheap: a
+## stroke replaces only the tiles it touched, and history keeps the old ones.
+## Texels are straight-alpha rgba16_float in the document's working space
+## (linear light). A tile lives on the GPU, in RAM, or both (tiles/residency):
+## `texture` brings it to the GPU when it is wanted there.
+import c
 import gpu
 import memory
 import os
+import platform
 import thread
 from luce_canvas.half import to_half, from_half
 from raster_errors import invalid, limit
@@ -16,12 +19,25 @@ pub let tile_size: u32 = 256
 
 ## One shared tile. Its texture is never written once shared; a stroke may
 ## draw again into a tile only it holds (`redrawn`), which gives it a new stamp.
+## Its content has a copy on the GPU (`on_gpu`, `texture`), in RAM (`ram`, the
+## texture's 256 rows of half floats), or both; see tiles/residency.
 pub struct Tile:
     var texture: gpu.Texture
+    var on_gpu: bool
+    var ram: u8[]
     var references: usize
     ## Unique among every tile's content so far: what the compositor's cache
     ## keys on, so only the cells that changed are flattened again.
     var stamp: u64
+    ## The residency epoch it was last handed out in: pinned on the GPU while
+    ## that epoch lasts.
+    var used: u64
+    ## The marking generation that last found it in a document (not only in
+    ## history or a job's copy).
+    var live: u64
+    ## Every tile, in the order made: what the governor walks.
+    var previous: Tile*?
+    var next: Tile*?
 
 ## The last stamp handed out; tiles live on the main thread.
 var last_stamp: u64 = 0
@@ -45,7 +61,7 @@ func retain(tile: Tile*) -> Tile*:
 func release(tile: Tile*):
     tile.references -= 1
     if tile.references == 0:
-        tile.texture.destroy()
+        forget_tile(tile)
         free(tile) in memory.heap
         live_tiles -= 1
 
@@ -129,10 +145,17 @@ pub struct Tiles:
     pub func tile(column: u32, row: u32) -> Tile*?:
         return self.cells[try_index(&self, column, row) else return none]
 
-    ## The tile texture at a cell, borrowed, or `none` when transparent.
-    pub func texture(column: u32, row: u32) -> gpu.Texture?:
+    ## The tile texture at a cell, borrowed for the current residency epoch
+    ## (it stays on the GPU until the next frame's `advance`), or `none` when
+    ## transparent. A tile kept only in RAM goes back to the GPU first.
+    pub func texture(column: u32, row: u32) -> gpu.Texture?!:
         let tile = self.tile(column, row) else return none
-        return tile.texture
+        return try resident(tile, self.owner)
+
+    ## Whether a cell holds a tile (is not transparent), without bringing it
+    ## to the GPU.
+    pub func painted(column: u32, row: u32) -> bool:
+        return self.tile(column, row) != none
 
     ## A second holder of the same tiles.
     pub func clone() -> Tiles!:
@@ -156,8 +179,7 @@ pub struct Tiles:
         let index = try self.index(column, row)
         if (try texture.width()) != tile_size or (try texture.height()) != tile_size or (try texture.pixel_format()) != gpu.Format.rgba16_float:
             error(invalid, "a tile is a 256 by 256 rgba16_float texture")
-        let tile = try new Tile(texture = texture, references = 1, stamp = next_stamp()) in memory.heap
-        live_tiles += 1
+        let tile = try make_tile(texture)
         if let previous = self.cells[index]:
             release(previous)
         self.cells[index] = tile
@@ -213,7 +235,7 @@ pub struct Tiles:
     ## A fresh tile texture on the device, cleared to transparent, ready to be
     ## drawn into with a frame and then `set`.
     pub func blank() -> gpu.Texture!:
-        var texture = try gpu.Texture.create(self.owner, tile_size, tile_size, gpu.Format.rgba16_float)
+        var texture = try tile_texture(self.owner)
         errdefer texture.destroy()
         # Cleared on the device: no zeros filled and copied up from memory.
         let frame = try texture.frame()
@@ -241,7 +263,7 @@ pub struct Tiles:
                 if not painted[(usize)column]:
                     try self.clear(column, row)
                     continue
-                var texture = try gpu.Texture.create(self.owner, tile_size, tile_size, gpu.Format.rgba16_float)
+                var texture = try tile_texture(self.owner)
                 errdefer texture.destroy()
                 let at = (usize)column * per_tile
                 try texture.upload(band[at..<at + per_tile])
@@ -309,7 +331,7 @@ pub struct Tiles:
         var count: usize = 0
         for row in 0..<self.cell_rows:
             for column in 0..<self.cell_columns:
-                if self.texture(column, row) != none:
+                if self.painted(column, row):
                     cells[count] = Cell(column = column, row = row)
                     count += 1
         var whole = WholeRead(pixels = pixels, width = (usize)self.extent_x, height = (usize)self.extent_y)
@@ -384,13 +406,13 @@ pub struct Tiles:
 
     ## The outside grid's texture at signed cell (`column`, `row`), borrowed:
     ## only its part past the canvas counts.
-    pub func outside_texture(column: i64, row: i64) -> gpu.Texture?:
+    pub func outside_texture(column: i64, row: i64) -> gpu.Texture?!:
         let outside = self.outside else return none
         let x = column - self.outside_column
         let y = row - self.outside_row
         if x < 0 or y < 0:
             return none
-        return outside.texture((u32)x, (u32)y)
+        return try outside.texture((u32)x, (u32)y)
 
     ## Make the outside grid cover `range` as well as what it covers already,
     ## its tiles kept.
@@ -435,8 +457,7 @@ pub struct Tiles:
             var dropped = texture
             dropped.destroy()
             return
-        let tile = try new Tile(texture = texture, references = 1, stamp = next_stamp()) in memory.heap
-        live_tiles += 1
+        let tile = try make_tile(texture)
         defer release(tile)
         if keep_inside:
             let index = try self.index((u32)column, (u32)row)
@@ -476,7 +497,7 @@ pub struct Tiles:
                     let area = self.region((u32)x, (u32)y)
                     inside_width = (usize)area.width
                     inside_height = (usize)area.height
-                try tile.texture.read(bytes)
+                try (try resident(tile, self.owner)).read(bytes)
                 var found = false
                 for texel_y in 0..<(usize)tile_size:
                     for texel_x in 0..<(usize)tile_size:
@@ -644,7 +665,7 @@ pub func flatten(device: gpu.Device, tiles: const Tiles*, empty: gpu.Color = gpu
     defer whole.release()
     for row in 0..<tiles.rows():
         for column in 0..<tiles.columns():
-            let texture = tiles.texture(column, row) else continue
+            let texture = (try tiles.texture(column, row)) else continue
             let area = tiles.region(column, row)
             try gpu.copy_image(whole.value(), texture, gpu.Rect((f64)(column * tile_size), (f64)(row * tile_size), (f64)area.width, (f64)area.height), area)
     discard(try frame.value().present(empty))

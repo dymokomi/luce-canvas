@@ -17,7 +17,7 @@ test "tiles share, replace, write and read on a device":
     pixels[(258 * 300 + 270) * 4 + 1] = 0.25
     pixels[(258 * 300 + 270) * 4 + 3] = 0.5
     try tiles.write(pixels)
-    assert(tiles.texture(0, 0) != none and tiles.texture(1, 0) == none and tiles.texture(0, 1) == none and tiles.texture(1, 1) != none)
+    assert(tiles.painted(0, 0) and not tiles.painted(1, 0) and not tiles.painted(0, 1) and tiles.painted(1, 1))
     var copy = try tiles.clone()
     defer copy.destroy()
     assert((tiles.tile(0, 0) else trap("missing tile")).references == 2)
@@ -34,7 +34,7 @@ test "tiles share, replace, write and read on a device":
     assert(back[(10 * 300 + 20) * 4] == 0.0 and back[(258 * 300 + 270) * 4 + 3] == 0.5)
     # A shared cell holds the same tile, and stamp, as its source.
     try copy.share(1, 0, 0, 0)
-    assert(copy.stamp(1, 0) == copy.stamp(0, 0) and copy.texture(1, 0) != none)
+    assert(copy.stamp(1, 0) == copy.stamp(0, 0) and copy.painted(1, 0))
     var rejected = false
     tiles.set(5, 0, try tiles.blank()) catch failure:
         assert(failure.code == invalid)
@@ -90,13 +90,13 @@ test "a cell reads back straight and writes back from premultiplied samples; a c
     cell[0] = 0.5
     cell[3] = 0.5
     try tiles.write_cell_premultiplied(1, 1, cell)
-    assert(tiles.texture(1, 1) != none)
+    assert(tiles.painted(1, 1))
     try tiles.read_cell(1, 1, cell)
     assert(cell[0] == 1.0 and cell[3] == 0.5 and cell[7] == 0.0)
     for index in 0..<cell.length:
         cell[index] = 0.0
     try tiles.write_cell_premultiplied(1, 1, cell)
-    assert(tiles.texture(1, 1) == none)
+    assert(not tiles.painted(1, 1))
 
 test "tiles_alive counts each tile once, shared or not, until its last holder lets go":
     var device = gpu.Device.open() catch failure:

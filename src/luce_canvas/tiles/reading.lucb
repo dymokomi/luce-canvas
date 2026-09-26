@@ -8,7 +8,9 @@
 #       takes as many tiles as a readback slot holds (64 at 256 pixels in rgba16f), so a whole
 #       360-megapixel layer is about 90 submissions and waits rather than one per tile. Every
 #       reader of layer pixels (whole reads, single cells, bounds, the wand, heal) goes
-#       through here.
+#       through here. A tile with a copy in RAM is read from there, with no GPU work at all;
+#       a whole tile read from the GPU leaves such a copy behind when the governor has room
+#       (tiles/residency), so the next reader, or evicting it, costs nothing.
 #
 #==============================================================================================
 
@@ -18,16 +20,19 @@ pub struct Cell:
     pub var row: u32
 
 ## One batch's share of the list: cells `first..<last`, and where each landed in
-## the batch (`empty_cell` for a cell with no tile).
+## the batch (`empty_cell` for a cell with no tile, `ram_cell` for one read
+## from its RAM copy, `sources` holding the tile).
 struct CellBatch:
     var batch: gpu.ReadBatch
     var first: usize
     var last: usize
     var offsets: usize[]
+    var sources: Tile*?[]
     var submitted: bool
     var pending: bool
 
 let empty_cell: usize = 0xffffffffffffffff
+let ram_cell: usize = 0xfffffffffffffffe
 
 ## Read `cells` of `tiles` back and call `visit(context, cell, bytes)` for each,
 ## in the list's order. `bytes` are the cell's rgba16f texels, rows 256 texels
@@ -46,6 +51,7 @@ pub func read_cells(tiles: const Tiles*, cells: const Cell[], context: void*?, v
         error(invalid, "a read batch cannot hold one tile")
     for index in 0..<(usize)2:
         batches[index].offsets = try alloc usize[per_batch] in memory.heap
+        batches[index].sources = try alloc Tile*?[per_batch] in memory.heap
     var next: usize = 0
     next = try fill_cell_batch(tiles, cells, &batches[0], next)
     if next < cells.length:
@@ -63,7 +69,17 @@ pub func read_cells(tiles: const Tiles*, cells: const Cell[], context: void*?, v
                 try visit(context, cell, nothing)
                 continue
             let rows = (usize)tiles.region(cell.column, cell.row).height
-            try visit(context, cell, try current.batch.bytes(offset, rows * (usize)tile_size * 8))
+            let length = rows * (usize)tile_size * 8
+            if offset == ram_cell:
+                let source = current.sources[index - current.first] else trap("a RAM cell lost its tile")
+                try visit(context, cell, source.ram[..<length])
+                continue
+            let bytes = try current.batch.bytes(offset, length)
+            # A whole tile read anyway is kept in RAM too while there is room.
+            if let source = current.sources[index - current.first]:
+                if rows == (usize)tile_size:
+                    keep_warm(source, bytes)
+            try visit(context, cell, bytes)
         current.pending = false
         if next < cells.length:
             next = try fill_cell_batch(tiles, cells, current, next)
@@ -82,11 +98,16 @@ func fill_cell_batch(tiles: const Tiles*, cells: const Cell[], target: CellBatch
     var at = next
     while at < cells.length and at - next < target.offsets.length:
         let cell = cells[at]
-        if let texture = tiles.texture(cell.column, cell.row):
-            let rows = tiles.region(cell.column, cell.row).height
-            let offset = (try target.batch.reserve(cell_bytes())) else break
-            try target.batch.copy(texture, gpu.Region(0, 0, tile_size, rows), offset)
-            target.offsets[at - next] = offset
+        target.sources[at - next] = none
+        if let tile = tiles.tile(cell.column, cell.row):
+            target.sources[at - next] = tile
+            if tile.ram.length > 0:
+                target.offsets[at - next] = ram_cell
+            else:
+                let rows = tiles.region(cell.column, cell.row).height
+                let offset = (try target.batch.reserve(cell_bytes())) else break
+                try target.batch.copy(tile.texture, gpu.Region(0, 0, tile_size, rows), offset)
+                target.offsets[at - next] = offset
         else:
             target.offsets[at - next] = empty_cell
         at += 1
@@ -103,6 +124,10 @@ func release_cell_batch(target: CellBatch*):
         free(target.offsets) in memory.heap
         var none_left: usize[]
         target.offsets = none_left
+    if target.sources.length > 0:
+        free(target.sources) in memory.heap
+        var no_sources: Tile*?[]
+        target.sources = no_sources
 
 # mark: The Tiles readers on it ===============================================================
 
@@ -175,7 +200,7 @@ func ring_cells(tiles: const Tiles*, cells: CellRange, ring: i64, read: const Bo
         let edge = row == cells.top + ring or row == cells.bottom - ring - 1
         var column = cells.left + ring
         while column < cells.right - ring:
-            if tiles.texture((u32)column, (u32)row) != none and not inside_bounds(tiles, read, (u32)column, (u32)row):
+            if tiles.painted((u32)column, (u32)row) and not inside_bounds(tiles, read, (u32)column, (u32)row):
                 if count == list.cells.length:
                     let grown = try alloc Cell[list.cells.length * 2 + 64] in memory.heap
                     memory.copy(grown, list.cells, count)

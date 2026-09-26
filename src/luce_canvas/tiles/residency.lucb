@@ -1,0 +1,175 @@
+#==============================================================================================
+#
+#   tiles/residency - Where a tile's bytes are: the GPU, RAM, or both
+#
+#   DESCRIPTION:
+#       A tile's content never changes, so any copy of it stays good for as long as the tile
+#       lives. A tile is on the GPU (G), in RAM (R, the texture's 256 rows of half floats),
+#       or both (G+R). Dropping a copy is free while the other one exists; moving the last
+#       copy costs one transfer: G to R a readback, R to G an upload.
+#
+#       `resident` is the one way to a tile's texture: it pins the tile for the current
+#       epoch (tiles/governor) and brings a RAM-only tile back to the GPU. `tile_texture`
+#       is the one way to a new tile-sized texture: when the device is out of memory it has
+#       the governor move unpinned tiles to RAM and tries again, so running out of GPU
+#       memory costs speed rather than an error. `demote` moves tiles to RAM a batch of
+#       readbacks at a time. Every tile is in one list, which the governor walks.
+#
+#==============================================================================================
+
+## Bytes of one tile's content, on the GPU or in RAM: 256 by 256 half-float RGBA.
+pub let tile_bytes: usize = 524288
+
+## The first and last tile made and not yet freed.
+var first_tile: Tile*? = none
+var last_tile: Tile*? = none
+
+## A new tile holding `texture` (taken over), on the GPU, held once.
+func make_tile(texture: gpu.Texture) -> Tile*!:
+    var no_ram: u8[]
+    let tile = try new Tile(texture = texture, on_gpu = true, ram = no_ram, references = 1, stamp = next_stamp(), used = residency_epoch, live = 0,
+                            previous = last_tile, next = none) in memory.heap
+    if let last = last_tile:
+        last.next = tile
+    else:
+        first_tile = tile
+    last_tile = tile
+    live_tiles += 1
+    gpu_tile_bytes += tile_bytes
+    return tile
+
+## Free what a tile holds in every tier and take it out of the list; its last
+## holder has let go.
+func forget_tile(tile: Tile*):
+    drop_gpu_copy(tile)
+    drop_ram_copy(tile)
+    if let previous = tile.previous:
+        previous.next = tile.next
+    else:
+        first_tile = tile.next
+    if let next = tile.next:
+        next.previous = tile.previous
+    else:
+        last_tile = tile.previous
+
+func drop_gpu_copy(tile: Tile*):
+    if not tile.on_gpu:
+        return
+    # Work still in flight keeps the texture alive; the backends defer the free.
+    tile.texture.destroy()
+    tile.texture = gpu.Texture()
+    tile.on_gpu = false
+    gpu_tile_bytes -= tile_bytes
+
+func drop_ram_copy(tile: Tile*):
+    if tile.ram.length == 0:
+        return
+    free(tile.ram) in memory.heap
+    var no_ram: u8[]
+    tile.ram = no_ram
+    ram_tile_bytes -= tile_bytes
+
+## The tile's texture on `device`, pinned for the current epoch; a tile kept
+## only in RAM is uploaded again first (its RAM copy stays, so evicting it
+## once more is free).
+func resident(tile: Tile*, device: gpu.Device) -> gpu.Texture!:
+    tile.used = residency_epoch
+    if tile.on_gpu:
+        return tile.texture
+    var texture = try tile_texture(device)
+    errdefer texture.destroy()
+    try texture.upload(tile.ram)
+    tile.texture = texture
+    tile.on_gpu = true
+    gpu_tile_bytes += tile_bytes
+    residency_promotions += 1
+    return texture
+
+## A new 256 by 256 rgba16_float texture on `device`, its content undefined.
+## When the device is out of memory, the governor moves unpinned tiles to RAM
+## (and trims derived caches) and it tries again; only when nothing is left to
+## move does it fail, with `gpu.out_of_memory`.
+pub func tile_texture(device: gpu.Device) -> gpu.Texture!:
+    var attempts: usize = 0
+    while attempts < 8:
+        attempts += 1
+        if let texture = try try_tile_texture(device):
+            return texture
+        if (try relieve(device, tile_bytes * 64)) == 0:
+            break
+    error(gpu.out_of_memory, "the GPU has no memory left for a tile, and nothing more can move to RAM")
+
+## A new tile texture, or none when the device is out of memory.
+func try_tile_texture(device: gpu.Device) -> gpu.Texture?!:
+    if residency_failures > 0:
+        # A test's simulated shortage.
+        residency_failures -= 1
+        return none
+    let texture = gpu.Texture.create(device, tile_size, tile_size, gpu.Format.rgba16_float) catch failure:
+        if failure.code == gpu.out_of_memory:
+            return none
+        error(failure.code, failure.message)
+    return texture
+
+## Keep `bytes` (a whole tile read back from the GPU anyway) as the tile's RAM
+## copy too, while the governor has room for it.
+func keep_warm(tile: Tile*, bytes: const u8[]):
+    if tile.ram.length > 0 or bytes.length != tile_bytes or not warm_room():
+        return
+    let copy = alloc u8[tile_bytes] in memory.heap catch failure:
+        discard(failure)
+        return
+    memory.copy(copy, bytes, tile_bytes)
+    tile.ram = copy
+    ram_tile_bytes += tile_bytes
+
+## Move `tiles` (on the GPU, unpinned) to RAM: those with a RAM copy just drop
+## their texture; the rest are read back a batch at a time first. A tile whose
+## RAM copy cannot be allocated stays on the GPU. How many bytes of GPU memory
+## were freed.
+func demote(device: gpu.Device, tiles: Tile*[]) -> usize!:
+    var freed: usize = 0
+    var batch = try gpu.ReadBatch.begin(device)
+    defer batch.finish()
+    let per_batch = batch.capacity() // tile_bytes
+    if per_batch == 0:
+        error(invalid, "a read batch cannot hold one tile")
+    let offsets = try alloc usize[per_batch] in memory.heap
+    defer free(offsets) in memory.heap
+    let waiting = try alloc Tile*[per_batch] in memory.heap
+    defer free(waiting) in memory.heap
+    var at: usize = 0
+    while at < tiles.length:
+        try batch.reset()
+        var count: usize = 0
+        while at < tiles.length and count < per_batch:
+            let tile = tiles[at]
+            at += 1
+            if not tile.on_gpu or tile.used == residency_epoch:
+                continue
+            if tile.ram.length > 0:
+                drop_gpu_copy(tile)
+                residency_demotions += 1
+                freed += tile_bytes
+                continue
+            let offset = (try batch.reserve(tile_bytes)) else break
+            try batch.copy(tile.texture, gpu.Region(0, 0, tile_size, tile_size), offset)
+            offsets[count] = offset
+            waiting[count] = tile
+            count += 1
+        if count == 0:
+            continue
+        try batch.submit()
+        try batch.wait()
+        for index in 0..<count:
+            let tile = waiting[index]
+            let copy = alloc u8[tile_bytes] in memory.heap catch failure:
+                discard(failure)
+                continue
+            memory.copy(copy, try batch.bytes(offsets[index], tile_bytes), tile_bytes)
+            tile.ram = copy
+            ram_tile_bytes += tile_bytes
+            drop_gpu_copy(tile)
+            residency_demotions += 1
+            freed += tile_bytes
+    return freed

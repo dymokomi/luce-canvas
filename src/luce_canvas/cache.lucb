@@ -9,13 +9,16 @@
 #       eviction costs the same whatever the count). What a request is still using is held:
 #       nothing used since `hold` is dropped until the next one, so a composite never loses a
 #       layer tile it fetched a moment ago. When everything is held, the cache goes over its
-#       budget rather than fail, and settles back at the next request.
+#       budget rather than fail, and settles back at the next request. Its bytes count toward
+#       the GPU's budget (tiles/governor), and while the GPU is short it keeps only the
+#       governor's `cache_scale` of its budget.
 #
 #==============================================================================================
 
 import gpu
 import memory
 from luce_canvas.keymap import KeyMap
+from luce_canvas.tiles import residency_derived, residency_cache_scale
 from raster_errors import invalid
 
 struct CacheEntry:
@@ -58,6 +61,9 @@ pub struct TileCache:
     pub mutating func hold():
         self.tick += 1
         self.guard = self.tick
+        # While the GPU is short, give back what the governor asks for.
+        if self.held_bytes > self.limit():
+            self.make_room(0)
 
     ## The tile kept for `key`, borrowed; none when it is not kept.
     pub mutating func find(key: u64) -> gpu.Texture?:
@@ -83,11 +89,13 @@ pub struct TileCache:
         self.entries[at] = CacheEntry(key = key, texture = texture, bytes = bytes, used = self.tick, recent = recent, live = true)
         try self.map.put(key, (u32)at)
         self.held_bytes += bytes
+        residency_derived(bytes, true)
 
     ## Drop entries (unheld, least recently wanted first) until `bytes` more fit.
     mutating func make_room(bytes: usize):
         var passes: usize = 0
-        while self.held_bytes + bytes > self.budget and passes < self.entries.length * 2:
+        let limit = self.limit()
+        while self.held_bytes + bytes > limit and passes < self.entries.length * 2:
             let at = self.hand
             self.hand = (self.hand + 1) % self.entries.length
             passes += 1
@@ -128,7 +136,12 @@ pub struct TileCache:
         self.map.remove(self.entries[at].key)
         self.entries[at].texture.destroy()
         self.held_bytes -= self.entries[at].bytes
+        residency_derived(self.entries[at].bytes, false)
         self.entries[at].live = false
+
+    ## The budget as the governor allows it now.
+    func limit() -> usize:
+        return max_usize(1, (usize)((f64)self.budget * residency_cache_scale()))
 
     ## What the cache keeps, in bytes.
     pub func bytes() -> usize:

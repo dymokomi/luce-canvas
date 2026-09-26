@@ -1,0 +1,279 @@
+#==============================================================================================
+#
+#   tiles/governor - Keeping tiles within the GPU's and the machine's memory
+#
+#   DESCRIPTION:
+#       One governor per process. It knows every tile's tier (tiles/residency) and the bytes
+#       each tier holds, and keeps them within two budgets: the GPU's, a share (Settings,
+#       60% by default) of what the device reports it can hold, and RAM's, the same share of
+#       the machine's memory. Derived tiles (pyramid levels, composites) live in TileCaches,
+#       which count their bytes here and shrink to `cache_scale` of their budgets when the
+#       GPU is short.
+#
+#       Pins: every tile handed out (`resident`) carries the epoch it was handed out in, and
+#       nothing handed out in the current epoch is evicted. The editor `advance`s the epoch
+#       as a frame begins, when nothing from the frame before is still being recorded, and
+#       `settle`s at its end.
+#
+#       Eviction takes the least wanted first:
+#         1. tiles no document shows: history's, and jobs' copies (known exactly after the
+#            editor marks what its documents hold);
+#         2. tiles a document shows that no recent frame drew;
+#         3. tiles recent frames drew, least recently first.
+#       Evicting moves a tile to RAM (tiles/residency), never drops it: undo, and the view
+#       coming back, bring it to the GPU again. Only when the GPU is out of memory and no
+#       tile can move does allocating fail.
+#
+#       Not yet: compressed RAM and a scratch disk (the design's C and D tiers). RAM-only
+#       tiles beyond the RAM budget stay where they are; the history budget (Settings ›
+#       Undo memory) is what bounds them.
+#
+#==============================================================================================
+
+## The current epoch: tiles used in it are pinned on the GPU.
+var residency_epoch: u64 = 1
+## The current marking: tiles marked with it are shown by a document.
+var live_generation: u64 = 0
+## Bytes held: level-0 tiles on the GPU, their RAM copies, and derived tiles.
+var gpu_tile_bytes: usize = 0
+var ram_tile_bytes: usize = 0
+var derived_tile_bytes: usize = 0
+## The budgets, 0 for none (the default until `configure`).
+var gpu_budget: usize = 0
+var ram_budget: usize = 0
+var unified_memory: bool = false
+## How much of their budgets derived caches may use now.
+var cache_scale_now: f64 = 1.0
+## Moves made, for tests and reports.
+var residency_promotions: u64 = 0
+var residency_demotions: u64 = 0
+## Tile allocations a test wants to fail as if the device were out of memory.
+var residency_failures: usize = 0
+
+## Epochs a tile counts as recently drawn for.
+let recent_epochs: u64 = 2
+
+## What the tiers hold and may hold, in bytes.
+pub struct ResidencyReport:
+    pub var gpu_tiles: usize
+    pub var ram_tiles: usize
+    pub var derived: usize
+    pub var gpu_budget: usize
+    pub var ram_budget: usize
+    pub var promotions: u64
+    pub var demotions: u64
+
+# mark: The governor's controls (one set per process; tiles live on the main thread) ==========
+
+## Budget both tiers as `usage` (0.1..0.95) of what `device` reports it can
+## hold and of the machine's memory. On unified memory (Apple silicon) the
+## GPU's memory is RAM, so RAM copies of GPU tiles are not kept warm.
+pub func residency_configure(device: gpu.Device, usage: f64) -> !:
+    if not (usage >= 0.1 and usage <= 0.95):
+        error(invalid, "memory usage must be 0.1..0.95 of what the machine has")
+    let reported = try device.memory()
+    unified_memory = reported.unified
+    gpu_budget = (usize)((f64)reported.budget * usage)
+    ram_budget = (usize)((f64)physical_memory() * usage)
+
+## Set the budgets directly, in bytes, 0 for none: tests, and forcing a
+## small budget to see the governor work.
+pub func residency_budgets(gpu_bytes: usize, ram_bytes: usize):
+    gpu_budget = gpu_bytes
+    ram_budget = ram_bytes
+
+## Begin a new epoch: what earlier ones pinned may move again.
+pub func residency_advance():
+    residency_epoch += 1
+
+## Whether the GPU tiers hold more than their budget: then the editor marks
+## what its documents show and settles.
+pub func residency_over_budget() -> bool:
+    return (gpu_budget > 0 and gpu_tile_bytes + derived_tile_bytes > gpu_budget) or (ram_budget > 0 and ram_tile_bytes > ram_budget)
+
+## Begin marking what documents show: tiles not marked before `settle` are
+## the first to leave the GPU.
+pub func residency_begin_marking():
+    live_generation += 1
+
+## Mark every tile `tiles` holds (on the canvas and past it) as shown.
+pub func residency_mark_live(tiles: const Tiles*):
+    for cell in tiles.cells:
+        if let tile = cell:
+            tile.live = live_generation
+    if let outside = tiles.outside:
+        residency_mark_live(outside)
+
+## Keep the tiers within their budgets: shrink derived caches and move the
+## least wanted GPU tiles to RAM until the GPU holds 85% of its budget, and
+## drop RAM copies of tiles still on the GPU while RAM holds too much.
+pub func residency_settle(device: gpu.Device) -> !:
+    if gpu_budget > 0:
+        let held = gpu_tile_bytes + derived_tile_bytes
+        if held > gpu_budget:
+            cache_scale_now = max_f64(0.125, cache_scale_now * 0.5)
+            let target = gpu_budget // 100 * 85
+            discard(try evict(device, held - target))
+        elif held < gpu_budget // 10 * 6:
+            cache_scale_now = min_f64(1.0, cache_scale_now * 1.25)
+    if ram_budget > 0 and ram_tile_bytes > ram_budget:
+        drop_warm_copies(ram_tile_bytes - ram_budget)
+
+## The share of their budgets derived caches may keep now.
+pub func residency_cache_scale() -> f64:
+    return cache_scale_now
+
+## A derived cache now holds `bytes` more (`added`) or fewer.
+pub func residency_derived(bytes: usize, added: bool):
+    if added:
+        derived_tile_bytes += bytes
+    else:
+        derived_tile_bytes -= bytes if bytes <= derived_tile_bytes else derived_tile_bytes
+
+## The next `count` tile allocations fail as if the device were out of memory.
+pub func residency_fail_allocations(count: usize):
+    residency_failures = count
+
+pub func residency_report() -> ResidencyReport:
+    return ResidencyReport(gpu_tiles = gpu_tile_bytes, ram_tiles = ram_tile_bytes, derived = derived_tile_bytes, gpu_budget = gpu_budget, ram_budget = ram_budget,
+                           promotions = residency_promotions, demotions = residency_demotions)
+
+## The device is out of memory: shrink derived caches and move unpinned tiles
+## to RAM, `wanted` bytes' worth, least wanted first. Bytes freed.
+func relieve(device: gpu.Device, wanted: usize) -> usize!:
+    cache_scale_now = max_f64(0.125, cache_scale_now * 0.5)
+    return try evict(device, wanted)
+
+## Whether a tile read back anyway may keep a RAM copy: not on unified memory,
+## and while warm copies take under half the RAM budget.
+func warm_room() -> bool:
+    if unified_memory or ram_budget == 0:
+        return false
+    return ram_tile_bytes + tile_bytes <= ram_budget // 2
+
+# mark: Choosing what leaves ==================================================================
+
+## A GPU tile that may leave, and its order: class in the top byte, then
+## the epoch it was last used in (older first).
+struct Candidate:
+    var tile: Tile*
+    var key: u64
+
+## Move at least `wanted` bytes of unpinned GPU tiles to RAM, least wanted
+## first. Bytes freed.
+func evict(device: gpu.Device, wanted: usize) -> usize!:
+    if wanted == 0:
+        return 0
+    var count: usize = 0
+    var cursor = first_tile
+    while let tile = cursor:
+        if tile.on_gpu and tile.used != residency_epoch:
+            count += 1
+        cursor = tile.next
+    if count == 0:
+        return 0
+    let candidates = try alloc Candidate[count] in memory.heap
+    defer free(candidates) in memory.heap
+    var at: usize = 0
+    cursor = first_tile
+    while let tile = cursor:
+        if tile.on_gpu and tile.used != residency_epoch and at < count:
+            candidates[at] = Candidate(tile = tile, key = eviction_key(tile))
+            at += 1
+        cursor = tile.next
+    sort_candidates(candidates[..<at])
+    let taking = min_usize(at, (wanted + tile_bytes - 1) // tile_bytes)
+    let chosen = try alloc Tile*[taking] in memory.heap
+    defer free(chosen) in memory.heap
+    for index in 0..<taking:
+        chosen[index] = candidates[index].tile
+    return try demote(device, chosen)
+
+func eviction_key(tile: const Tile*) -> u64:
+    var class: u64 = 2
+    if tile.live != live_generation:
+        class = 1
+    elif tile.used + recent_epochs >= residency_epoch:
+        class = 3
+    let used = tile.used if tile.used < (1u64 << 56) else (1u64 << 56) - 1
+    return (class << 56) | used
+
+## Heap sort by key, smallest first: no recursion, no allocation.
+func sort_candidates(items: Candidate[]):
+    let count = items.length
+    if count < 2:
+        return
+    var start = count // 2
+    while start > 0:
+        start -= 1
+        sift_down(items, start, count)
+    var end = count
+    while end > 1:
+        end -= 1
+        let top = items[0]
+        items[0] = items[end]
+        items[end] = top
+        sift_down(items, 0, end)
+
+func sift_down(items: Candidate[], first: usize, count: usize):
+    var root = first
+    while root * 2 + 1 < count:
+        var child = root * 2 + 1
+        if child + 1 < count and items[child + 1].key > items[child].key:
+            child += 1
+        if items[root].key >= items[child].key:
+            return
+        let swapped = items[root]
+        items[root] = items[child]
+        items[child] = swapped
+        root = child
+
+## Free RAM copies of tiles that are also on the GPU, the least recently used
+## first, until `wanted` bytes are gone or none is left.
+func drop_warm_copies(wanted: usize):
+    var freed: usize = 0
+    var cursor = first_tile
+    while let tile = cursor:
+        if freed >= wanted:
+            return
+        cursor = tile.next
+        if tile.on_gpu and tile.ram.length > 0:
+            drop_ram_copy(tile)
+            freed += tile_bytes
+
+# mark: The machine's memory ==================================================================
+
+extern func sysctlbyname(name: c.str, value: void*, length: usize*, new_value: void*?, new_length: usize) -> i32
+extern func sysconf(name: i32) -> i64
+extern func GlobalMemoryStatusEx(status: void*) -> i32
+
+## The machine's physical memory in bytes; 0 when it cannot be told.
+func physical_memory() -> u64:
+    if platform.macos:
+        var value: u64 = 0
+        var length: usize = 8
+        if sysctlbyname((c.str)"hw.memsize", (void*)&value, &length, none, 0) != 0:
+            return 0
+        return value
+    elif platform.windows:
+        # MEMORYSTATUSEX: dwLength first, ullTotalPhys at byte 8.
+        var status: u8[64]
+        memory.set(status, 0)
+        status[0] = 64
+        if GlobalMemoryStatusEx((void*)&status[0]) == 0:
+            return 0
+        var total: u64 = 0
+        for index in 0..<(usize)8:
+            total |= (u64)status[8 + index] << (u64)(index * 8)
+        return total
+    else:
+        # _SC_PHYS_PAGES and _SC_PAGESIZE on Linux.
+        let pages = sysconf(85)
+        let size = sysconf(30)
+        return (u64)pages * (u64)size if pages > 0 and size > 0 else 0
+
+func min_f64(a: f64, b: f64) -> f64:
+    return a if a < b else b
+
+func max_f64(a: f64, b: f64) -> f64:
+    return a if a > b else b

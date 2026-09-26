@@ -1,0 +1,170 @@
+#==============================================================================================
+#
+#   tiles/residency_tests - Tiers and the governor
+#
+#==============================================================================================
+
+## A 1024 by 512 layer (4 by 2 cells) whose every pixel differs: red and green
+## from the position, blue from `seed`, alpha opaque.
+func distinct_layer(device: gpu.Device, seed: f32) -> Tiles!:
+    var tiles = try Tiles.create(device, 1024, 512)
+    errdefer tiles.destroy()
+    let count = (usize)1024 * 512 * 4
+    let pixels = try alloc f32[count] in memory.heap
+    defer free(pixels) in memory.heap
+    for y in 0..<(usize)512:
+        for x in 0..<(usize)1024:
+            let at = (y * 1024 + x) * 4
+            pixels[at] = (f32)x / 1024.0
+            pixels[at + 1] = (f32)y / 512.0
+            pixels[at + 2] = seed
+            pixels[at + 3] = 1.0
+    try tiles.write(pixels)
+    return tiles
+
+## Every pixel of `tiles`, read back.
+func read_all(tiles: const Tiles*) -> f32[]!:
+    let pixels = try alloc f32[(usize)tiles.width() * (usize)tiles.height() * 4] in memory.heap
+    errdefer free(pixels) in memory.heap
+    try tiles.read(pixels)
+    return pixels
+
+func same_samples(a: const f32[], b: const f32[]) -> bool:
+    if a.length != b.length:
+        return false
+    for index in 0..<a.length:
+        if a[index] != b[index]:
+            return false
+    return true
+
+## How many of `tiles`' tiles are on the GPU.
+func gpu_count(tiles: const Tiles*) -> usize:
+    var count: usize = 0
+    for cell in tiles.cells:
+        if let tile = cell:
+            if tile.on_gpu:
+                count += 1
+    return count
+
+test "a tile moved to RAM reads the same, from RAM, and comes back to the GPU when drawn with":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    defer residency_budgets(0, 0)
+    var tiles = try distinct_layer(device, 0.25)
+    defer tiles.destroy()
+    let before = try read_all(&tiles)
+    defer free(before) in memory.heap
+    # A budget of one tile: settling moves the rest to RAM.
+    residency_budgets(tile_bytes, 0)
+    residency_advance()
+    let demoted = residency_report().demotions
+    try residency_settle(device)
+    assert(gpu_count(&tiles) <= 1 and residency_report().demotions > demoted)
+    # Reads come from the RAM copies, identical, and bring nothing back.
+    let after = try read_all(&tiles)
+    defer free(after) in memory.heap
+    assert(same_samples(before, after) and gpu_count(&tiles) <= 1)
+    # Drawing with a tile brings it back; its texels are the same.
+    let promoted = residency_report().promotions
+    let texture = (try tiles.texture(2, 1)) else trap("a painted cell")
+    assert(residency_report().promotions == promoted + 1 or gpu_count(&tiles) >= 1)
+    var texel: u8[8]
+    try texture.read(texel, gpu.Region(10, 20, 1, 1))
+    let red = from_half((u16)texel[0] | ((u16)texel[1] << 8))
+    let expected = before[((256 + 20) * 1024 + 512 + 10) * 4]
+    assert(red == from_half(to_half(expected)))
+
+test "under a tiny budget the pixels stay exactly as they were, through edits and settling":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    defer residency_budgets(0, 0)
+    var first = try distinct_layer(device, 0.5)
+    defer first.destroy()
+    var second = try distinct_layer(device, 0.75)
+    defer second.destroy()
+    let one = try read_all(&first)
+    defer free(one) in memory.heap
+    let two = try read_all(&second)
+    defer free(two) in memory.heap
+    residency_budgets(tile_bytes * 3, 0)
+    for round in 0..<(usize)4:
+        residency_advance()
+        # Use a few tiles each round, as frames would, then settle.
+        discard(try first.texture((u32)(round % 4), 0))
+        discard(try second.texture((u32)(round % 4), 1))
+        try residency_settle(device)
+    # A copy made now shares the moved tiles and reads the same.
+    var copy = try first.clone()
+    defer copy.destroy()
+    let three = try read_all(&copy)
+    defer free(three) in memory.heap
+    let four = try read_all(&second)
+    defer free(four) in memory.heap
+    assert(same_samples(one, three) and same_samples(two, four))
+
+test "when the device is out of memory, allocating moves unpinned tiles to RAM and succeeds":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    defer residency_fail_allocations(0)
+    var tiles = try distinct_layer(device, 0.125)
+    defer tiles.destroy()
+    let before = try read_all(&tiles)
+    defer free(before) in memory.heap
+    residency_advance()
+    # An allocation fails as if the device were full: the tiles move to RAM
+    # (nothing was used this epoch), and the next try gets its texture.
+    let demoted = residency_report().demotions
+    residency_fail_allocations(1)
+    var texture = try tile_texture(device)
+    texture.destroy()
+    assert(residency_report().demotions > demoted and gpu_count(&tiles) == 0)
+    let after = try read_all(&tiles)
+    defer free(after) in memory.heap
+    assert(same_samples(before, after))
+    # A tile handed out this epoch is pinned: a shortage moves others, not it.
+    var spare = try distinct_layer(device, 0.875)
+    defer spare.destroy()
+    residency_advance()
+    discard(try tiles.texture(1, 1))
+    residency_fail_allocations(1)
+    var again = try tile_texture(device)
+    again.destroy()
+    assert((tiles.tile(1, 1) else trap("a tile")).on_gpu and gpu_count(&spare) == 0)
+    # With nothing left to move, a shortage is an error.
+    residency_advance()
+    for row in 0..<tiles.rows():
+        for column in 0..<tiles.columns():
+            discard(try tiles.texture(column, row))
+    residency_fail_allocations(20)
+    assert(try out_of_memory_now(device))
+
+## Whether allocating a tile now fails with out_of_memory.
+func out_of_memory_now(device: gpu.Device) -> bool!:
+    var texture = tile_texture(device) catch failure:
+        return failure.code == gpu.out_of_memory
+    texture.destroy()
+    return false
+
+test "tiles only history holds leave the GPU before the tiles a document shows":
+    var device = gpu.Device.open() catch failure:
+        assert(failure.code == gpu.unavailable)
+        return
+    defer device.destroy()
+    defer residency_budgets(0, 0)
+    var shown = try distinct_layer(device, 0.3)
+    defer shown.destroy()
+    var history = try distinct_layer(device, 0.6)
+    defer history.destroy()
+    # Room for the shown layer's 8 tiles and a few more.
+    residency_budgets(tile_bytes * 12, 0)
+    residency_advance()
+    residency_begin_marking()
+    residency_mark_live(&shown)
+    try residency_settle(device)
+    assert(gpu_count(&shown) == 8 and gpu_count(&history) < 8)

@@ -11,7 +11,16 @@ fast on ordinary machines. The design is in luced-2d's
 ## Modules
 
 - `tiles`: `Tiles`, a layer's grid of shared tiles over its extent, with the cells kept
-  past the canvas.
+  past the canvas. Each tile lives on the GPU, in RAM, or both, and a governor keeps
+  both within budgets:
+  - `residency_configure(device, usage)` budgets a share of the device's and the
+    machine's memory;
+  - `residency_advance()` starts a frame (tiles handed out since are pinned);
+  - `residency_begin_marking()` and `residency_mark_live(tiles)` say what documents
+    show;
+  - `residency_settle(device)` moves the least wanted tiles to RAM;
+  - `tile_texture(device)` makes a tile, making room when the device is full;
+  - `residency_report()` tells what each tier holds.
 - `half`: IEEE 754 binary16 conversion for `rgba16_float` texels.
 - `pyramid`: a store's coarser levels, averaged in premultiplied space, keyed by
   content and made on demand.

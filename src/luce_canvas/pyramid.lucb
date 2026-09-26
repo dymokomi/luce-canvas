@@ -18,7 +18,7 @@
 
 import gpu
 import memory
-from luce_canvas.tiles import Tiles, tile_size, min_u32
+from luce_canvas.tiles import Tiles, tile_size, min_u32, tile_texture
 from luce_canvas.cache import TileCache
 from luce_canvas.shaders import halve_frag_words, halve_frag_msl
 from luce_canvas.half import from_half
@@ -59,7 +59,7 @@ pub struct Pyramid:
     ## every frame needs.
     mutating func level_tile(tiles: const Tiles*, column: u32, row: u32, level: u32, mask: bool, wanted: bool) -> gpu.Texture?!:
         if level == 0:
-            return tiles.texture(column, row)
+            return try tiles.texture(column, row)
         if level > 16:
             error(invalid, "pyramid levels go up to 16")
         let key = level_key(tiles, column, row, level, mask)
@@ -80,7 +80,7 @@ pub struct Pyramid:
                     present[quarter] = true
                 covered[quarter * 2] = covered_at(tiles.width(), fine_column, level - 1)
                 covered[quarter * 2 + 1] = covered_at(tiles.height(), fine_row, level - 1)
-        var texture = try gpu.Texture.create(self.owner, tile_size, tile_size, gpu.Format.rgba16_float)
+        var texture = try tile_texture(self.owner)
         errdefer texture.destroy()
         let frame = try texture.frame()
         defer frame.release()
