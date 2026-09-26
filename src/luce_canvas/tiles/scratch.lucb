@@ -11,9 +11,12 @@
 #       used again before the file grows. The file is made the first time it is needed, in a
 #       fresh directory under the scratch directory (`set_scratch_directory`, else a disk-backed
 #       default: on Linux the user's cache, since /tmp is often RAM-backed tmpfs there, which
-#       would put the spilled tiles back in memory; elsewhere the system's temporary one). On
-#       macOS and Linux its name is removed at once, so nothing is left behind whatever way the
-#       process ends.
+#       would put the spilled tiles back in memory; elsewhere the system's temporary one). It
+#       is opened as a temporary file, gone with its last handle whatever way the process
+#       ends: on macOS and Linux its name is removed at once; on Windows the system deletes
+#       it when the handle closes. A Windows folder of it can outlive the process, so a new
+#       scratch file first sweeps stale ones away; `release_scratch` removes this one on a
+#       clean exit.
 #
 #==============================================================================================
 
@@ -70,24 +73,106 @@ func temporary_root() -> str:
         return chosen
     return "/tmp"
 
+## The name of the scratch file inside its folder.
+let scratch_name: str = "tiles.scratch"
+
+## The folder holding this process's scratch file while one is open (Windows).
+var scratch_folder: str = ""
+
 ## The scratch file, made on first use.
 func scratch_file() -> files.File*!:
     if let open = scratch:
         return open
-    let directory = try files.create_temporary_directory((c.str)(try scratch_root()))
-    let path = try paths.join(directory, "tiles.scratch")
-    var opened = try files.File.open((c.str)path, files.OpenMode.create_new_read_write, permissions = 384)
+    let root = try scratch_root()
+    sweep_stale(root)
+    let directory = try files.create_temporary_directory((c.str)root)
+    let path = try paths.join(directory, scratch_name)
+    var opened = try files.File.open((c.str)path, files.OpenMode.create_temporary, permissions = 384)
     errdefer opened.destroy()
     let kept = try new files.File in memory.heap
     *kept = opened
     scratch = kept
-    if not platform.windows:
-        # The open file lives on without a name; nothing is left behind.
-        files.remove_file((c.str)path) catch failure:
-            discard(failure)
+    keep_folder(directory)
+    return kept
+
+## macOS and Linux: the file has no name already, so its folder goes now.
+## Windows: the file keeps its name until it closes, so its folder is kept
+## for `release_scratch`.
+func keep_folder(directory: str):
+    if platform.windows:
+        scratch_folder = directory
+    else:
         files.remove_directory((c.str)directory) catch failure:
             discard(failure)
-    return kept
+
+## On a clean exit: close the scratch file (Windows deletes it then) and remove
+## its folder. Tiles moved to it are gone, so the documents must be closed first.
+pub func release_scratch():
+    if let open = scratch:
+        open.destroy()
+        free(open) in memory.heap
+        scratch = none
+    scratch_end = 0
+    free_count = 0
+    disk_tile_bytes = 0
+    if scratch_folder.length > 0:
+        files.remove_directory((c.str)scratch_folder) catch failure:
+            discard(failure)
+        scratch_folder = ""
+
+## Windows: remove the folders earlier runs left under `root` (a killed process
+## leaves its folder; the system already deleted the file inside unless the run
+## predates temporary files). A folder is taken only when it is one of ours by
+## name and holds nothing but a scratch file; a file another running instance
+## still has open cannot go, and its folder stays.
+func sweep_stale(root: str):
+    if platform.windows:
+        let names = files.list((c.str)root) catch failure:
+            discard(failure)
+            return
+        defer files.release_list(names)
+        for name in names:
+            if not is_scratch_folder(name):
+                continue
+            let folder = paths.join(root, name) catch failure:
+                discard(failure)
+                continue
+            remove_stale_folder(folder)
+    else:
+        return
+
+## Remove `folder` if it holds at most a scratch file.
+func remove_stale_folder(folder: str):
+    let inside = files.list((c.str)folder) catch failure:
+        discard(failure)
+        return
+    defer files.release_list(inside)
+    if not only_scratch(inside):
+        return
+    if inside.length == 1:
+        let file = paths.join(folder, scratch_name) catch failure:
+            discard(failure)
+            return
+        files.remove_file((c.str)file) catch failure:
+            discard(failure)
+            return
+    files.remove_directory((c.str)folder) catch failure:
+        discard(failure)
+
+## Whether `name` is a folder `create_temporary_directory` makes: `.luce-` and 32
+## lower-case hexadecimal digits.
+func is_scratch_folder(name: str) -> bool:
+    if name.length != 38 or not strings.starts_with(name, ".luce-"):
+        return false
+    for index in 6..<name.length:
+        let byte = name.bytes[index]
+        if not ((byte >= '0' and byte <= '9') or (byte >= 'a' and byte <= 'f')):
+            return false
+    return true
+
+## Whether a folder's entries are nothing but (at most) the scratch file.
+func only_scratch(names: const str[]) -> bool:
+    return names.length == 0 or (names.length == 1 and names[0] == scratch_name)
 
 ## A slot for one tile: a freed one, else the end of the file.
 func take_slot() -> i64!:

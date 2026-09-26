@@ -4,4 +4,5 @@ residency.lucb
 scratch.lucb
 governor.lucb
 residency_tests.lucb
+scratch_tests.lucb
 tests.lucb

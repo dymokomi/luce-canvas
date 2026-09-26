@@ -1,0 +1,38 @@
+# The scratch folder's cleanup: which folders a sweep may take, and taking them.
+
+test "only folders named as ours, holding at most a scratch file, are stale":
+    assert(is_scratch_folder(".luce-0123456789abcdef0123456789abcdef"))
+    assert(not is_scratch_folder(".luce-0123456789ABCDEF0123456789abcdef"))
+    assert(not is_scratch_folder(".luce-0123"))
+    assert(not is_scratch_folder("luce-0123456789abcdef0123456789abcdef0"))
+    assert(not is_scratch_folder(".other0123456789abcdef0123456789abcdef"))
+    var none_inside: str[]
+    assert(only_scratch(none_inside))
+    assert(only_scratch(["tiles.scratch"]))
+    assert(not only_scratch(["notes.txt"]))
+    assert(not only_scratch(["tiles.scratch", "notes.txt"]))
+
+test "a stale folder with its scratch file goes; one holding anything else stays":
+    let root = try files.create_temporary_directory((c.str)temporary_root())
+    let stale = try paths.join(root, ".luce-00000000000000000000000000000001")
+    try files.ensure_directory(stale)
+    try files.write((c.str)(try paths.join(stale, "tiles.scratch")), "tiles".bytes)
+    let kept = try paths.join(root, ".luce-00000000000000000000000000000002")
+    try files.ensure_directory(kept)
+    try files.write((c.str)(try paths.join(kept, "tiles.scratch")), "tiles".bytes)
+    try files.write((c.str)(try paths.join(kept, "notes.txt")), "mine".bytes)
+    let empty = try paths.join(root, ".luce-00000000000000000000000000000003")
+    try files.ensure_directory(empty)
+    remove_stale_folder(stale)
+    remove_stale_folder(kept)
+    remove_stale_folder(empty)
+    assert(not files.exists((c.str)stale))
+    assert(files.exists((c.str)kept))
+    assert(not files.exists((c.str)empty))
+    try files.remove_tree((c.str)root)
+
+test "releasing the scratch file lets it and its folder go":
+    discard(try scratch_file())
+    assert(scratch != none)
+    release_scratch()
+    assert(scratch == none and scratch_folder == "")
