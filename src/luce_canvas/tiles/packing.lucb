@@ -103,20 +103,10 @@ func run_shares(count: usize, work: func(void*?, usize, usize) -> unit, context:
         work(context, 0, count)
         return
     var shares: Share[16] = ---
-    var handles: thread.Handle[16]
-    var started: usize = 0
     let per = (count + workers - 1) // workers
     for index in 0..<workers:
         shares[index] = Share(work = work, context = context, first = min_usize(count, index * per), last = min_usize(count, index * per + per))
-    for index in 1..<workers:
-        handles[started] = thread.spawn(share_entry, (void*)&shares[index], name = "tiles-pack") catch failure:
-            for other in index..<workers:
-                share_entry((void*)&shares[other])
-            break
-        started += 1
-    share_entry((void*)&shares[0])
-    for index in 0..<started:
-        try handles[index].join()
+    pool.run(workers, share_entry, (void*)&shares[0])
 
 ## One thread's part of `run_shares`.
 struct Share:
@@ -125,6 +115,6 @@ struct Share:
     var first: usize
     var last: usize
 
-func share_entry(context: void*?):
-    let share = (Share*)(context else return)
+func share_entry(context: void*?, index: usize):
+    let share = &((Share*)(context else return))[index]
     share.work(share.context, share.first, share.last)

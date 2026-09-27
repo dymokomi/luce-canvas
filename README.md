@@ -24,6 +24,11 @@ fast on ordinary machines. The design is in luced-2d's
 - `wake`: `set_wake(callback)` registers what wakes the app's frame loop
   (its window's wake) and `wake_frames()` calls it from any thread, so work
   finished on a worker is taken in at once; the engine never talks to a window.
+- `pool`: the engine's one set of worker threads, started on first use and kept
+  for the process. `run(count, entry, context, limit)` runs `entry(context, i)` for
+  every `i` with the caller working too, so batches started inside batches finish;
+  `start(job, ...)`, `finished(job)` and `wait(job)` put a batch out in the
+  background (tile prefetch) and collect it.
 - `half`: IEEE 754 binary16 conversion for `rgba16_float` texels.
 - `pyramid`: a store's coarser levels, averaged in premultiplied space, keyed by
   content and made on demand.

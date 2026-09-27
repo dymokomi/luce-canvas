@@ -80,8 +80,9 @@ struct PackShare:
     var jobs: PackJob[]
     var decoding: bool
 
-func pack_entry(context: void*?):
-    run_pack_jobs((PackShare*)(context else return))
+func pack_entry(context: void*?, index: usize):
+    let shares = (PackShare*)(context else return)
+    run_pack_jobs(&shares[index])
 
 func run_pack_jobs(share: PackShare*):
     for index in 0..<share.jobs.length:
@@ -108,17 +109,7 @@ func spread_pack(jobs: PackJob[], decoding: bool) -> !:
     for index in 0..<workers:
         let first = min_usize(jobs.length, index * per)
         shares[index] = PackShare(jobs = jobs[first..<min_usize(jobs.length, first + per)], decoding = decoding)
-    var handles: thread.Handle[16]
-    var started: usize = 0
-    for index in 1..<workers:
-        handles[started] = thread.spawn(pack_entry, (void*)&shares[index], name = "tiles-pack") catch failure:
-            discard(failure)
-            run_pack_jobs(&shares[index])
-            continue
-        started += 1
-    run_pack_jobs(&shares[0])
-    for index in 0..<started:
-        try handles[index].join()
+    pool.run(workers, pack_entry, (void*)&shares[0])
 
 ## Compress `tiles` (RAM copies, not yet compressed) across the processors;
 ## each that compresses to three quarters of its size or less keeps only its

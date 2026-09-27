@@ -31,10 +31,10 @@ struct Pending:
 struct Prefetch:
     var storage: Pending[]
     var items: Pending[]
-    var next: @usize
-    var done: @usize
-    var handles: thread.Handle[8]
-    var started: usize
+    ## The pool batch decoding the items.
+    var job: pool.Job
+    ## Items decoded so far: the last one wakes the app.
+    var decoded: @usize
 
 var in_flight: Prefetch*? = none
 ## Whether the last batch collected had a tile that could not be decoded.
@@ -63,9 +63,8 @@ pub func prefetch_tiles(list: Tile*[]) -> bool!:
     if count == 0:
         return true
     let storage = try alloc Pending[count] in memory.heap
-    let batch = try new Prefetch(storage = storage, items = storage, started = 0) in memory.heap
-    batch.next.store(0, .relaxed)
-    batch.done.store(0, .relaxed)
+    let batch = try new Prefetch(storage = storage, items = storage, job = pool.Job()) in memory.heap
+    batch.decoded.store(0, .relaxed)
     var at: usize = 0
     for tile in list:
         if at == count or not prefetchable(tile):
@@ -130,41 +129,32 @@ func unpackable(context: void*?, packed: const u8[], rows: u32, into: u8[]) -> !
     discard(into)
     error(invalid, "a compressed tile came back without a codec")
 
-## The batch's first `count` items to up to eight workers.
+## The batch's first `count` items to up to eight of the pool's workers.
 func start_batch(batch: Prefetch*, count: usize) -> !:
     let items = batch.items
     batch.items = items[..<count]
     in_flight = batch
-    let workers = min_usize(8, min_usize(count, max_usize(1, (usize)os.cpus() - 1)))
-    for index in 0..<workers:
-        batch.handles[batch.started] = thread.spawn(prefetch_entry, (void*)batch, name = "tiles-prefetch") catch failure:
-            discard(failure)
-            break
-        batch.started += 1
-    if batch.started == 0:
-        # No thread to be had: decode here, the batch done at once.
-        prefetch_entry((void*)batch)
+    if count == 0:
+        wake_frames()
+        return
+    pool.start(&batch.job, count, prefetch_item, (void*)batch, limit = min_usize(8, max_usize(1, (usize)os.cpus() - 1)))
 
-func prefetch_entry(context: void*?):
+func prefetch_item(context: void*?, index: usize):
     let batch = (Prefetch*)(context else return)
-    while true:
-        let index = batch.next.add(1, .relaxed)
-        if index >= batch.items.length:
-            break
-        let item = &batch.items[index]
-        item.decode(item.context, item.packed, item.rows, item.copy) catch failure:
-            discard(failure)
-            item.failed = true
-    discard(batch.done.add(1, .acq_rel))
-    # The app's loop may be asleep until input: ask it for the frame that
-    # collects the batch.
-    wake_frames()
+    let item = &batch.items[index]
+    item.decode(item.context, item.packed, item.rows, item.copy) catch failure:
+        discard(failure)
+        item.failed = true
+    # The last item done: the app's loop may be asleep until input, so ask it
+    # for the frame that collects the batch.
+    if batch.decoded.add(1, .acq_rel) + 1 == batch.items.length:
+        wake_frames()
 
 ## If the batch out has finished, give its tiles their decoded copies; whether
 ## any tile came back.
 pub func prefetch_collect() -> bool!:
     let batch = in_flight else return false
-    if batch.done.load(.acquire) < max_usize(1, batch.started):
+    if not pool.finished(&batch.job):
         return false
     return try finish_batch(batch)
 
@@ -176,8 +166,7 @@ pub func prefetch_wait() -> !:
 
 func finish_batch(batch: Prefetch*) -> bool!:
     in_flight = none
-    for index in 0..<batch.started:
-        try batch.handles[index].join()
+    pool.wait(&batch.job)
     var any = false
     prefetch_failed = false
     for index in 0..<batch.items.length:

@@ -159,8 +159,9 @@ struct FetchJob:
 struct FetchShare:
     var jobs: FetchJob[]
 
-func fetch_entry(context: void*?):
-    decode_jobs((FetchShare*)(context else return))
+func fetch_entry(context: void*?, index: usize):
+    let shares = (FetchShare*)(context else return)
+    decode_jobs(&shares[index])
 
 func decode_jobs(share: FetchShare*):
     for index in 0..<share.jobs.length:
@@ -178,17 +179,7 @@ func spread_fetch(jobs: FetchJob[]) -> !:
     for index in 0..<workers:
         let first = min_usize(jobs.length, index * per)
         shares[index] = FetchShare(jobs = jobs[first..<min_usize(jobs.length, first + per)])
-    var handles: thread.Handle[16]
-    var started: usize = 0
-    for index in 1..<workers:
-        handles[started] = thread.spawn(fetch_entry, (void*)&shares[index], name = "tiles-fetch") catch failure:
-            discard(failure)
-            decode_jobs(&shares[index])
-            continue
-        started += 1
-    decode_jobs(&shares[0])
-    for index in 0..<started:
-        try handles[index].join()
+    pool.run(workers, fetch_entry, (void*)&shares[0])
 
 ## Before `source`'s file goes (a save over it): every tile backed by it
 ## that `keep` does not re-home is brought into RAM and let go of its
