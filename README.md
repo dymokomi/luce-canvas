@@ -21,6 +21,9 @@ fast on ordinary machines. The design is in luced-2d's
   - `residency_settle(device)` moves the least wanted tiles to RAM;
   - `tile_texture(device)` makes a tile, making room when the device is full;
   - `residency_report()` tells what each tier holds.
+- `wake`: `set_wake(callback)` registers what wakes the app's frame loop
+  (its window's wake) and `wake_frames()` calls it from any thread, so work
+  finished on a worker is taken in at once; the engine never talks to a window.
 - `half`: IEEE 754 binary16 conversion for `rgba16_float` texels.
 - `pyramid`: a store's coarser levels, averaged in premultiplied space, keyed by
   content and made on demand.

@@ -5,7 +5,7 @@ import argparse, os, subprocess, sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-MODULES = ['half', 'tiles', 'keymap', 'cache', 'pyramid']
+MODULES = ['half', 'wake', 'tiles', 'keymap', 'cache', 'pyramid']
 
 
 def main():

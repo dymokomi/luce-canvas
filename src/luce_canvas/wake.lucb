@@ -1,0 +1,39 @@
+## Waking the app's frame loop from a worker thread. The engine never talks to
+## a window: work finished off the main thread (a prefetch batch, a picture's
+## band, a preview worked out in the background) calls `wake_frames`, which
+## calls what the app registered with `set_wake`, its window's wake, so a loop
+## asleep until input (Windows waits up to a second) takes the work in at once.
+## Without a registration, nothing: a test or a headless run polls anyway.
+
+## The registered callback as an untyped pointer: atomic, so a worker reads
+## either none or a whole registration.
+var wake_target: @void*?
+
+## Call `callback` whenever work done off the main thread wants a frame; none
+## stops. It runs on the worker's thread, so it must be safe to call from any
+## thread and must not fail.
+pub func set_wake(callback: (func() -> unit)?):
+    if let chosen = callback:
+        wake_target.store((void*)chosen, .release)
+    else:
+        wake_target.store(none, .release)
+
+## Ask the app for a frame at once, from any thread.
+pub func wake_frames():
+    let raw = wake_target.load(.acquire) else return
+    let callback = (func() -> unit)raw
+    callback()
+
+var test_wakes: @usize
+
+func count_wake():
+    discard(test_wakes.add(1, .relaxed))
+
+test "a registered wake is called; none stops it":
+    wake_frames()
+    set_wake(count_wake)
+    wake_frames()
+    assert(test_wakes.load(.relaxed) == 1)
+    set_wake(none)
+    wake_frames()
+    assert(test_wakes.load(.relaxed) == 1)
