@@ -19,7 +19,7 @@
 #
 #==============================================================================================
 
-import luce_gpu.gpu
+from luce_gpu import gpu
 import memory
 from tiles import Gathering, Tiles, tile_size, min_u32, tile_texture, transient_mark, release_transients
 from cache import TileCache

@@ -19,7 +19,7 @@
 #
 #==============================================================================================
 
-import luce_gpu.gpu
+from luce_gpu import gpu
 import memory
 from keymap import KeyMap
 from tiles import residency_derived, residency_cache_scale
