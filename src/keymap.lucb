@@ -11,7 +11,7 @@
 #==============================================================================================
 
 import memory
-from raster_errors import invalid
+from luce_raster.errors import invalid
 
 pub struct KeyMap:
     var keys: u64[]

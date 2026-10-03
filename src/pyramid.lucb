@@ -19,13 +19,13 @@
 #
 #==============================================================================================
 
-import gpu
+import luce_gpu.gpu
 import memory
-from luce_canvas.tiles import Gathering, Tiles, tile_size, min_u32, tile_texture, transient_mark, release_transients
-from luce_canvas.cache import TileCache
-from luce_canvas.shaders import halve_frag_words, halve_frag_msl
-from luce_canvas.half import from_half
-from raster_errors import invalid
+from tiles import Gathering, Tiles, tile_size, min_u32, tile_texture, transient_mark, release_transients
+from cache import TileCache
+from shaders import halve_frag_words, halve_frag_msl
+from half import from_half
+from luce_raster.errors import invalid
 
 ## Bytes of one rgba16_float tile.
 pub let tile_bytes: usize = 256 * 256 * 8

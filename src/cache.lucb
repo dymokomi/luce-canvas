@@ -19,11 +19,11 @@
 #
 #==============================================================================================
 
-import gpu
+import luce_gpu.gpu
 import memory
-from luce_canvas.keymap import KeyMap
-from luce_canvas.tiles import residency_derived, residency_cache_scale
-from raster_errors import invalid
+from keymap import KeyMap
+from tiles import residency_derived, residency_cache_scale
+from luce_raster.errors import invalid
 
 struct CacheEntry:
     var key: u64

@@ -7,17 +7,17 @@
 ## (linear light). A tile lives on the GPU, in RAM, or both (tiles/residency):
 ## `texture` brings it to the GPU when it is wanted there.
 import c
-import files
-import gpu
+import luce_std.files
+import luce_gpu.gpu
 import memory
 import os
-import paths
+import luce_std.paths
 import platform
 import strings
-import luce_canvas.pool as pool
-from luce_canvas.half import to_half, from_half
-from luce_canvas.wake import wake_frames
-from raster_errors import invalid, limit
+import pool
+from half import to_half, from_half
+from wake import wake_frames
+from luce_raster.errors import invalid, limit
 
 pub let tile_size: u32 = 256
 
