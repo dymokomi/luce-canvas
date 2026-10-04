@@ -7,6 +7,7 @@
 ## (linear light). A tile lives on the GPU, in RAM, or both (tiles/residency):
 ## `texture` brings it to the GPU when it is wanted there.
 import c
+import interop
 from luce_std import files
 from luce_gpu import gpu
 import memory

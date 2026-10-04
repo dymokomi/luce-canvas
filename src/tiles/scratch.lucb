@@ -45,27 +45,26 @@ pub func set_scratch_directory(directory: str) -> !:
     chosen_root = copied
 
 ## The directory scratch files go in: the chosen one, else a disk-backed default.
-func scratch_root() -> str!:
+func scratch_root() -> interop.Owned[str]!:
     if chosen_root.length > 0:
-        return chosen_root
+        return interop.Owned[str](chosen_root)
     if platform.linux:
         return try linux_cache_root()
     else:
-        return temporary_root()
+        return interop.Owned[str](temporary_root())
 
 ## Linux: $XDG_CACHE_HOME/luce, else ~/.cache/luce, made if missing; /tmp when
 ## there is no home at all.
-func linux_cache_root() -> str!:
-    var cache = ""
+func linux_cache_root() -> interop.Owned[str]!:
+    var root = interop.Owned[str](temporary_root())
     if let chosen = os.env((c.str)"XDG_CACHE_HOME"):
-        cache = chosen
+        root = try paths.join(chosen, "luce")
     elif let home = os.env((c.str)"HOME"):
-        cache = try paths.join(home, ".cache")
-        try files.ensure_directory(cache)
+        root = try paths.join(home, ".cache/luce")
     else:
-        return temporary_root()
-    let root = try paths.join(cache, "luce")
-    try files.ensure_directory(root)
+        return root
+    errdefer root.release()
+    try files.ensure_directory(root.value)
     return root
 
 ## The directory temporary files go in: TMPDIR or TEMP, else /tmp.
@@ -80,17 +79,20 @@ func temporary_root() -> str:
 let scratch_name: str = "tiles.scratch"
 
 ## The folder holding this process's scratch file while one is open (Windows).
-var scratch_folder: str = ""
+var scratch_folder: interop.Owned[str]? = none
 
 ## The scratch file, made on first use.
 func scratch_file() -> files.File*!:
     if let open = scratch:
         return open
     let root = try scratch_root()
-    sweep_stale(root)
-    let directory = try files.create_temporary_directory((c.str)root)
-    let path = try paths.join(directory, scratch_name)
-    var opened = try files.File.open((c.str)path, files.OpenMode.create_temporary, permissions = 384)
+    defer root.release()
+    sweep_stale(root.value)
+    let directory = try files.create_temporary_directory((c.str)root.value)
+    errdefer directory.release()
+    let path = try paths.join(directory.value, scratch_name)
+    defer path.release()
+    var opened = try files.File.open((c.str)path.value, files.OpenMode.create_temporary, permissions = 384)
     errdefer opened.destroy()
     let kept = try new files.File in memory.heap
     *kept = opened
@@ -101,12 +103,13 @@ func scratch_file() -> files.File*!:
 ## macOS and Linux: the file has no name already, so its folder goes now.
 ## Windows: the file keeps its name until it closes, so its folder is kept
 ## for `release_scratch`.
-func keep_folder(directory: str):
+func keep_folder(directory: interop.Owned[str]):
     if platform.windows:
         scratch_folder = directory
     else:
-        files.remove_directory((c.str)directory) catch failure:
+        files.remove_directory((c.str)directory.value) catch failure:
             discard(failure)
+        directory.release()
 
 ## On a clean exit: close the scratch file (Windows deletes it then) and remove
 ## its folder. Tiles moved to it are gone, so the documents must be closed first.
@@ -118,10 +121,11 @@ pub func release_scratch():
     scratch_end = 0
     free_count = 0
     disk_tile_bytes = 0
-    if scratch_folder.length > 0:
-        files.remove_directory((c.str)scratch_folder) catch failure:
+    if let folder = scratch_folder:
+        files.remove_directory((c.str)folder.value) catch failure:
             discard(failure)
-        scratch_folder = ""
+        folder.release()
+        scratch_folder = none
 
 ## Windows: remove the folders earlier runs left under `root` (a killed process
 ## leaves its folder; the system already deleted the file inside unless the run
@@ -133,14 +137,15 @@ func sweep_stale(root: str):
         let names = files.list((c.str)root) catch failure:
             discard(failure)
             return
-        defer files.release_list(names)
-        for name in names:
+        defer names.release()
+        for name in names.value:
             if not is_scratch_folder(name):
                 continue
             let folder = paths.join(root, name) catch failure:
                 discard(failure)
                 continue
-            remove_stale_folder(folder)
+            remove_stale_folder(folder.value)
+            folder.release()
     else:
         return
 
@@ -149,14 +154,15 @@ func remove_stale_folder(folder: str):
     let inside = files.list((c.str)folder) catch failure:
         discard(failure)
         return
-    defer files.release_list(inside)
-    if not only_scratch(inside):
+    defer inside.release()
+    if not only_scratch(inside.value):
         return
-    if inside.length == 1:
+    if inside.value.length == 1:
         let file = paths.join(folder, scratch_name) catch failure:
             discard(failure)
             return
-        files.remove_file((c.str)file) catch failure:
+        defer file.release()
+        files.remove_file((c.str)file.value) catch failure:
             discard(failure)
             return
     files.remove_directory((c.str)folder) catch failure:

@@ -363,8 +363,10 @@ test "tiles backed by a document file leave the GPU and RAM without being writte
     defer free(before) in memory.heap
     # The layer's cells, raw, in a file of their own.
     let folder = try files.create_temporary_directory((c.str)temporary_root())
-    let path = try paths.join(folder, "backing.raw")
-    var file = try files.File.open((c.str)path, files.OpenMode.replace)
+    defer folder.release()
+    let path = try paths.join(folder.value, "backing.raw")
+    defer path.release()
+    var file = try files.File.open((c.str)path.value, files.OpenMode.replace)
     var cells: Cell[8] = ---
     for index in 0..<(usize)8:
         cells[index] = Cell(column = (u32)(index % 4), row = (u32)(index // 4))
@@ -372,7 +374,7 @@ test "tiles backed by a document file leave the GPU and RAM without being writte
     defer free(sink.offsets) in memory.heap
     try read_cells(&tiles, cells, (void*)&sink, write_raw, warm = false)
     try file.close()
-    let source = try open_tile_source(path, none, decode_raw)
+    let source = try open_tile_source(path.value, none, decode_raw)
     for index in 0..<(usize)8:
         try back_cell(&tiles, cells[index].column, cells[index].row, source, sink.offsets[index], (u32)tile_bytes, tile_size)
     assert(source.references == 9)
@@ -393,7 +395,7 @@ test "tiles backed by a document file leave the GPU and RAM without being writte
     try tiles.redrawn(1, 0)
     assert(drawn.source == none and source.references == 8)
     release_tile_source(source)
-    try files.remove_tree((c.str)folder)
+    try files.remove_tree((c.str)folder.value)
 
 test "tiles on the scratch file freed after the scratch file is released do not upset the accounting":
     var device = gpu.Device.open() catch failure:
