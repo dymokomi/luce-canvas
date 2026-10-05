@@ -81,12 +81,12 @@ pub struct Gathering:
     var waiting: Tile*[]
     var waiting_count: usize
 
-    pub func create() -> Gathering:
+    pub static func create() -> Gathering:
         var list: Tile*[64] = ---
         var none_waiting: Tile*[]
         return Gathering(list = list, count = 0, later = false, waiting = none_waiting, waiting_count = 0)
 
-    pub func deferred() -> Gathering:
+    pub static func deferred() -> Gathering:
         var gathering = Gathering.create()
         gathering.later = true
         return gathering

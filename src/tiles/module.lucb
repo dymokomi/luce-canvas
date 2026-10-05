@@ -129,7 +129,7 @@ pub struct Tiles:
     var outside_row: i64
 
     ## Fully transparent pixels for a `width` by `height` layer.
-    pub func create(device: gpu.Device, width: u32, height: u32) -> Tiles!:
+    pub static func create(device: gpu.Device, width: u32, height: u32) -> Tiles!:
         if width == 0 or height == 0 or width > 65536 or height > 65536:
             error(invalid, "layer dimensions must be in 1..65536")
         let columns = tile_columns(width)

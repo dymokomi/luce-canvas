@@ -19,7 +19,7 @@ pub struct KeyMap:
     var count: usize
 
     ## A table for up to `capacity` keys.
-    pub func create(capacity: usize) -> KeyMap!:
+    pub static func create(capacity: usize) -> KeyMap!:
         var size: usize = 16
         while size < capacity * 2:
             size *= 2

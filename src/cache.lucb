@@ -53,7 +53,7 @@ pub struct TileCache:
 
     ## A cache keeping at most `budget` bytes of tiles (`smallest` bytes the
     ## smallest a tile is, which sets how many entries it may need).
-    pub func create(budget: usize, smallest: usize = 131072) -> TileCache!:
+    pub static func create(budget: usize, smallest: usize = 131072) -> TileCache!:
         if budget == 0 or smallest == 0:
             error(invalid, "a tile cache needs a budget")
         let capacity = max_usize(64, budget // smallest + 64)

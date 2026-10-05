@@ -39,7 +39,7 @@ pub struct Pyramid:
     pub var renders: u64
 
     ## Levels for stores on `device`, keeping at most `budget` bytes of them.
-    pub func create(device: gpu.Device, budget: usize) -> Pyramid!:
+    pub static func create(device: gpu.Device, budget: usize) -> Pyramid!:
         var shader = try gpu.Shader.create(device, halve_frag_words, halve_frag_msl)
         errdefer shader.destroy()
         var pipeline = try gpu.Pipeline.create(device, shader, gpu.Blend.replace, gpu.Format.rgba16_float)
