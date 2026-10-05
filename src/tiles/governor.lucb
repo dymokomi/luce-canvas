@@ -189,7 +189,7 @@ pub func residency_settle(device: gpu.Device) -> !:
             let dropped = drop_warm_copies(wanted)
             wanted = wanted - dropped if dropped < wanted else 0
             if wanted > 0:
-                discard(try spill_ram(wanted))
+                _ = try spill_ram(wanted)
 
 ## The share of their budgets derived caches may keep now.
 pub func residency_cache_scale() -> f64:
@@ -248,7 +248,7 @@ func evict(device: gpu.Device, wanted: usize) -> usize!:
         cursor = tile.next
     if count == 0:
         return 0
-    let candidates = try alloc Candidate[count] in memory.heap
+    let candidates = try new Candidate[count] --- in memory.heap
     defer free(candidates) in memory.heap
     var at: usize = 0
     cursor = first_tile
@@ -259,7 +259,7 @@ func evict(device: gpu.Device, wanted: usize) -> usize!:
         cursor = tile.next
     sort_candidates(candidates[..<at])
     let taking = min_usize(at, (wanted + tile_bytes - 1) // tile_bytes)
-    let chosen = try alloc Tile*[taking] in memory.heap
+    let chosen = try new Tile*[taking] --- in memory.heap
     defer free(chosen) in memory.heap
     for index in 0..<taking:
         chosen[index] = candidates[index].tile
@@ -317,7 +317,7 @@ func spill_ram(wanted: usize) -> usize!:
         cursor = tile.next
     if count == 0:
         return 0
-    let candidates = try alloc Candidate[count] in memory.heap
+    let candidates = try new Candidate[count] --- in memory.heap
     defer free(candidates) in memory.heap
     var at: usize = 0
     cursor = first_tile
@@ -428,12 +428,12 @@ pub func process_memory() -> usize:
 ## Linux: the resident pages /proc/self/statm gives second, as bytes.
 func linux_resident() -> usize:
     var opened = files.File.open((c.str)"/proc/self/statm", files.OpenMode.read) catch failure:
-        discard(failure)
+        _ = failure
         return 0
     defer opened.destroy()
     var text: u8[128]
     let count = opened.read(text) catch failure:
-        discard(failure)
+        _ = failure
         return 0
     var field: usize = 0
     var value: usize = 0

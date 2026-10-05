@@ -7,7 +7,7 @@ test "tiles share, replace, write and read on a device":
     defer tiles.destroy()
     assert(tiles.columns() == 2 and tiles.rows() == 2 and tiles.region(1, 1).width == 44 and tiles.region(1, 1).height == 4)
     let count = (usize)300 * 260 * 4
-    let pixels = try alloc f32[count] in memory.heap
+    let pixels = try new f32[count] --- in memory.heap
     defer free(pixels) in memory.heap
     for index in 0..<count:
         pixels[index] = 0.0
@@ -24,7 +24,7 @@ test "tiles share, replace, write and read on a device":
     let fresh = try tiles.blank()
     try tiles.set(0, 0, fresh)
     assert((copy.tile(0, 0) else trap("missing tile")).references == 1)
-    let back = try alloc f32[count] in memory.heap
+    let back = try new f32[count] --- in memory.heap
     defer free(back) in memory.heap
     try copy.read(back)
     assert(back[(10 * 300 + 20) * 4] == 1.0 and back[(10 * 300 + 20) * 4 + 3] == 1.0)
@@ -51,7 +51,7 @@ test "content bounds read from the outside in, and still find inner pixels":
     defer tiles.destroy()
     assert(try tiles.content_bounds() == none)
     let count = (usize)1200 * 1000 * 4
-    let pixels = try alloc f32[count] in memory.heap
+    let pixels = try new f32[count] --- in memory.heap
     defer free(pixels) in memory.heap
     for index in 0..<count:
         pixels[index] = 0.0
@@ -82,7 +82,7 @@ test "a cell reads back straight and writes back from premultiplied samples; a c
     defer device.destroy()
     var tiles = try Tiles.create(device, 300, 260)
     defer tiles.destroy()
-    let cell = try alloc f32[(usize)tile_size * (usize)tile_size * 4] in memory.heap
+    let cell = try new f32[(usize)tile_size * (usize)tile_size * 4] --- in memory.heap
     defer free(cell) in memory.heap
     try tiles.read_cell(1, 1, cell)
     assert(cell[0] == 0.0 and cell[3] == 0.0)
@@ -146,7 +146,7 @@ test "read_cells reads more cells than a batch holds, in order, empty ones as no
     var tiles = try Tiles.create(device, 3000, 2000)
     defer tiles.destroy()
     let count = (usize)3000 * 2000 * 4
-    let pixels = try alloc f32[count] in memory.heap
+    let pixels = try new f32[count] --- in memory.heap
     defer free(pixels) in memory.heap
     for index in 0..<count:
         pixels[index] = 0.0
@@ -172,7 +172,7 @@ test "read_cells reads more cells than a batch holds, in order, empty ones as no
     for index in 0..<(usize)96:
         assert(seen.order[index].column == cells[index].column and seen.order[index].row == cells[index].row)
     # The whole read agrees with what was written.
-    let back = try alloc f32[count] in memory.heap
+    let back = try new f32[count] --- in memory.heap
     defer free(back) in memory.heap
     try tiles.read(back)
     for index in 0..<count:
@@ -185,7 +185,7 @@ test "writing band by band makes the same tiles as writing the whole picture":
     defer device.destroy()
     let width: usize = 600
     let height: usize = 530
-    let pixels = try alloc f32[width * height * 4] in memory.heap
+    let pixels = try new f32[width * height * 4] --- in memory.heap
     defer free(pixels) in memory.heap
     for at in 0..<width * height:
         let x = at % width
@@ -204,9 +204,9 @@ test "writing band by band makes the same tiles as writing the whole picture":
         let top = (usize)row * (usize)tile_size
         let rows = min_usize((usize)tile_size, height - top)
         try banded.write_band(row, pixels[top * width * 4..<(top + rows) * width * 4])
-    let a = try alloc f32[width * height * 4] in memory.heap
+    let a = try new f32[width * height * 4] --- in memory.heap
     defer free(a) in memory.heap
-    let b = try alloc f32[width * height * 4] in memory.heap
+    let b = try new f32[width * height * 4] --- in memory.heap
     defer free(b) in memory.heap
     try whole.read(a)
     try banded.read(b)
@@ -220,27 +220,27 @@ test "a band packed from encoded samples through tables matches one packed from 
     let height: usize = 530
     for deep in [false, true]:
         let codes: usize = 65536 if deep else 256
-        let color = try alloc u16[codes] in memory.heap
+        let color = try new u16[codes] --- in memory.heap
         defer free(color) in memory.heap
-        let alpha = try alloc u16[codes] in memory.heap
+        let alpha = try new u16[codes] --- in memory.heap
         defer free(alpha) in memory.heap
         for code in 0..<codes:
             color[code] = to_half((f32)code / (f32)(codes - 1) * (f32)code / (f32)(codes - 1))
             alpha[code] = to_half((f32)code / (f32)(codes - 1))
         let columns = (usize)tile_columns((u32)width)
-        let coded = try alloc u8[packed_band_bytes((u32)width)] in memory.heap
+        let coded = try new u8[packed_band_bytes((u32)width)] --- in memory.heap
         defer free(coded) in memory.heap
-        let floated = try alloc u8[packed_band_bytes((u32)width)] in memory.heap
+        let floated = try new u8[packed_band_bytes((u32)width)] --- in memory.heap
         defer free(floated) in memory.heap
-        let coded_painted = try alloc bool[columns] in memory.heap
+        let coded_painted = try new bool[columns] --- in memory.heap
         defer free(coded_painted) in memory.heap
-        let floated_painted = try alloc bool[columns] in memory.heap
+        let floated_painted = try new bool[columns] --- in memory.heap
         defer free(floated_painted) in memory.heap
         for row in 0..<tile_columns((u32)height):
             let rows = min_usize((usize)tile_size, height - (usize)row * (usize)tile_size)
-            let samples = try alloc u8[width * rows * 4 * (2 if deep else 1)] in memory.heap
+            let samples = try new u8[width * rows * 4 * (2 if deep else 1)] --- in memory.heap
             defer free(samples) in memory.heap
-            let pixels = try alloc f32[width * rows * 4] in memory.heap
+            let pixels = try new f32[width * rows * 4] --- in memory.heap
             defer free(pixels) in memory.heap
             for at in 0..<width * rows * 4:
                 let x = (at // 4) % width

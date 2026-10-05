@@ -62,7 +62,7 @@ pub func prefetch_tiles(list: Tile*[]) -> bool!:
             count += 1
     if count == 0:
         return true
-    let storage = try alloc Pending[count] in memory.heap
+    let storage = try new Pending[count] --- in memory.heap
     let batch = try new Prefetch(storage = storage, items = storage, job = pool.Job()) in memory.heap
     batch.decoded.store(0, .relaxed)
     var at: usize = 0
@@ -72,7 +72,7 @@ pub func prefetch_tiles(list: Tile*[]) -> bool!:
         # One that cannot be read now is left to be brought back when asked for,
         # which reports why.
         batch.items[at] = pending_for(tile) catch failure:
-            discard(failure)
+            _ = failure
             continue
         at += 1
     try start_batch(batch, at)
@@ -94,12 +94,12 @@ func pending_for(tile: Tile*) -> Pending!:
     var item = Pending(tile = tile, stamp = tile.stamp, packed = no_bytes, copy = no_bytes, decode = codec_decode else unpackable,
                        context = codec_context, rows = tile_size, backed = false, failed = false)
     if tile.packed.length > 0:
-        item.packed = try alloc u8[tile.packed.length] in memory.heap
+        item.packed = try new u8[tile.packed.length] --- in memory.heap
         memory.copy(item.packed, tile.packed, tile.packed.length)
     elif tile.disk >= 0:
-        item.packed = try alloc u8[(usize)tile.disk_length] in memory.heap
+        item.packed = try new u8[(usize)tile.disk_length] --- in memory.heap
         let file = try scratch_file()
-        discard(try file.seek(tile.disk))
+        _ = try file.seek(tile.disk)
         var read: usize = 0
         while read < item.packed.length:
             let count = try file.read(item.packed[read..])
@@ -108,25 +108,25 @@ func pending_for(tile: Tile*) -> Pending!:
             read += count
     else:
         let source = tile.source else trap("a backed tile has its source")
-        item.packed = try alloc u8[(usize)tile.source_length] in memory.heap
+        item.packed = try new u8[(usize)tile.source_length] --- in memory.heap
         try read_record(source, tile.source_offset, item.packed)
         item.decode = source.decode
         item.context = source.context
         item.rows = tile.source_rows
         item.backed = true
     errdefer free(item.packed) in memory.heap
-    item.copy = try alloc u8[tile_bytes] in memory.heap
+    item.copy = try new u8[tile_bytes] --- in memory.heap
     memory.set(item.copy, 0)
     # Marked so another batch does not take it too.
     tile.loading = true
-    discard(retain(tile))
+    _ = retain(tile)
     return item
 
 func unpackable(context: void*?, packed: const u8[], rows: u32, into: u8[]) -> !:
-    discard(context)
-    discard(packed)
-    discard(rows)
-    discard(into)
+    _ = context
+    _ = packed
+    _ = rows
+    _ = into
     error(invalid, "a compressed tile came back without a codec")
 
 ## The batch's first `count` items to up to eight of the pool's workers.
@@ -143,7 +143,7 @@ func prefetch_item(context: void*?, index: usize):
     let batch = (Prefetch*)(context else return)
     let item = &batch.items[index]
     item.decode(item.context, item.packed, item.rows, item.copy) catch failure:
-        discard(failure)
+        _ = failure
         item.failed = true
     # The last item done: the app's loop may be asleep until input, so ask it
     # for the frame that collects the batch.
@@ -162,7 +162,7 @@ pub func prefetch_collect() -> bool!:
 ## everything (a document closing).
 pub func prefetch_wait() -> !:
     let batch = in_flight else return
-    discard(try finish_batch(batch))
+    _ = try finish_batch(batch)
 
 func finish_batch(batch: Prefetch*) -> bool!:
     in_flight = none

@@ -42,7 +42,7 @@ test "a stale folder with its scratch file goes; one holding anything else stays
     try files.remove_tree((c.str)root.value)
 
 test "releasing the scratch file lets it and its folder go":
-    discard(try scratch_file())
+    _ = try scratch_file()
     assert(scratch != none)
     release_scratch()
     assert(scratch == none and scratch_folder == none)

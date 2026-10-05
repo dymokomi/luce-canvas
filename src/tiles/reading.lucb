@@ -53,8 +53,8 @@ pub func read_cells(tiles: const Tiles*, cells: const Cell[], context: void*?, v
     if per_batch == 0:
         error(invalid, "a read batch cannot hold one tile")
     for index in 0..<(usize)2:
-        batches[index].offsets = try alloc usize[per_batch] in memory.heap
-        batches[index].sources = try alloc Tile*?[per_batch] in memory.heap
+        batches[index].offsets = try new usize[per_batch] --- in memory.heap
+        batches[index].sources = try new Tile*?[per_batch] --- in memory.heap
     var next: usize = 0
     next = try fill_cell_batch(tiles, cells, &batches[0], next)
     if next < cells.length:
@@ -145,7 +145,7 @@ func release_cell_batch(target: CellBatch*):
 
 ## `read_cell`'s visitor: one cell into 256 by 256 straight RGBA f32 samples.
 func cell_to_floats(context: void*?, cell: Cell, bytes: const u8[]) -> !:
-    discard(cell)
+    _ = cell
     let pixels = *(f32[]*)(context else trap("a cell read lost its buffer"))
     halves_to_floats(bytes, pixels, (usize)tile_size, 0, 0, (usize)tile_size)
 
@@ -214,7 +214,7 @@ func ring_cells(tiles: const Tiles*, cells: CellRange, ring: i64, read: const Bo
         while column < cells.right - ring:
             if tiles.painted((u32)column, (u32)row) and not inside_bounds(tiles, read, (u32)column, (u32)row):
                 if count == list.cells.length:
-                    let grown = try alloc Cell[list.cells.length * 2 + 64] in memory.heap
+                    let grown = try new Cell[list.cells.length * 2 + 64] --- in memory.heap
                     memory.copy(grown, list.cells, count)
                     list.release()
                     list.cells = grown
@@ -230,7 +230,7 @@ func ring_cells(tiles: const Tiles*, cells: CellRange, ring: i64, read: const Bo
 struct CellList:
     var cells: Cell[]
 
-    mutating func release():
+    func release():
         if self.cells.length > 0:
             free(self.cells) in memory.heap
         var none_left: Cell[]

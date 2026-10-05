@@ -10,7 +10,7 @@ func distinct_layer(device: gpu.Device, seed: f32) -> Tiles!:
     var tiles = try Tiles.create(device, 1024, 512)
     errdefer tiles.destroy()
     let count = (usize)1024 * 512 * 4
-    let pixels = try alloc f32[count] in memory.heap
+    let pixels = try new f32[count] --- in memory.heap
     defer free(pixels) in memory.heap
     for y in 0..<(usize)512:
         for x in 0..<(usize)1024:
@@ -24,7 +24,7 @@ func distinct_layer(device: gpu.Device, seed: f32) -> Tiles!:
 
 ## Every pixel of `tiles`, read back.
 func read_all(tiles: const Tiles*) -> f32[]!:
-    let pixels = try alloc f32[(usize)tiles.width() * (usize)tiles.height() * 4] in memory.heap
+    let pixels = try new f32[(usize)tiles.width() * (usize)tiles.height() * 4] --- in memory.heap
     errdefer free(pixels) in memory.heap
     try tiles.read(pixels)
     return pixels
@@ -94,8 +94,8 @@ test "under a tiny budget the pixels stay exactly as they were, through edits an
     for round in 0..<(usize)4:
         residency_advance()
         # Use a few tiles each round, as frames would, then settle.
-        discard(try first.texture((u32)(round % 4), 0))
-        discard(try second.texture((u32)(round % 4), 1))
+        _ = try first.texture((u32)(round % 4), 0)
+        _ = try second.texture((u32)(round % 4), 1)
         try residency_settle(device)
     # A copy made now shares the moved tiles and reads the same.
     var copy = try first.clone()
@@ -131,7 +131,7 @@ test "when the device is out of memory, allocating moves unpinned tiles to RAM a
     var spare = try distinct_layer(device, 0.875)
     defer spare.destroy()
     residency_advance()
-    discard(try tiles.texture(1, 1))
+    _ = try tiles.texture(1, 1)
     residency_fail_allocations(1)
     var again = try tile_texture(device)
     again.destroy()
@@ -140,7 +140,7 @@ test "when the device is out of memory, allocating moves unpinned tiles to RAM a
     residency_advance()
     for row in 0..<tiles.rows():
         for column in 0..<tiles.columns():
-            discard(try tiles.texture(column, row))
+            _ = try tiles.texture(column, row)
     residency_fail_allocations(20)
     assert(try out_of_memory_now(device))
 
@@ -185,7 +185,7 @@ test "a tile drawn into in place lets its warm RAM copy go, so reads see the new
     assert(tile.ram.length > 0)
     # Draw into the cell's texture in place: every texel half-transparent black.
     let texture = (try tiles.texture(1, 0)) else trap("a painted cell")
-    let texels = try alloc u8[(usize)tile_size * (usize)tile_size * 8] in memory.heap
+    let texels = try new u8[(usize)tile_size * (usize)tile_size * 8] --- in memory.heap
     defer free(texels) in memory.heap
     for at in 0..<texels.length // 8:
         let alpha = to_half(0.5)
@@ -276,16 +276,16 @@ test "an epoch lasts a frame: draws into one frame share it, and a frame inside 
     let inner_target = try inner.value().target()
     assert(not residency_frame(inner_target.value().frame_serial()) and residency_epoch == before + 1)
     inner_target.release()
-    discard(try inner.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
+    _ = try inner.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0))
     inner.release()
     target.release()
-    discard(try outer.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
+    _ = try outer.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0))
     outer.release()
     let next = try outer_texture.frame()
     let next_target = try next.value().target()
     assert(residency_frame(next_target.value().frame_serial()) and residency_epoch == before + 2)
     next_target.release()
-    discard(try next.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
+    _ = try next.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0))
     next.release()
 
 test "a tile from the scratch file drawn into in place lets its slot go, so it never reloads the old pixels":
@@ -303,7 +303,7 @@ test "a tile from the scratch file drawn into in place lets its slot go, so it n
     let texture = (try tiles.texture(2, 0)) else trap("a painted cell")
     let tile = tiles.tile(2, 0) else trap("a painted cell")
     assert(tile.disk >= 0)
-    let texels = try alloc u8[(usize)tile_size * (usize)tile_size * 8] in memory.heap
+    let texels = try new u8[(usize)tile_size * (usize)tile_size * 8] --- in memory.heap
     defer free(texels) in memory.heap
     for index in 0..<texels.length:
         texels[index] = 0
@@ -328,7 +328,7 @@ test "the process's memory is told where the system can tell it, and never past 
 
 ## A test source's decode: its records are raw tile rows.
 func decode_raw(context: void*?, packed: const u8[], rows: u32, into: u8[]) -> !:
-    discard(context)
+    _ = context
     let bytes = (usize)rows * (usize)tile_size * 8
     if packed.length < bytes:
         error(invalid, "a raw record is short")
@@ -342,7 +342,7 @@ struct RawSink:
     var written: u64
 
 func write_raw(context: void*?, cell: Cell, bytes: const u8[]) -> !:
-    discard(cell)
+    _ = cell
     let sink = (RawSink*)(context else return)
     sink.offsets[sink.at] = sink.written
     sink.at += 1
@@ -370,7 +370,7 @@ test "tiles backed by a document file leave the GPU and RAM without being writte
     var cells: Cell[8] = ---
     for index in 0..<(usize)8:
         cells[index] = Cell(column = (u32)(index % 4), row = (u32)(index // 4))
-    var sink = RawSink(file = &file, offsets = try alloc u64[8] in memory.heap, at = 0, written = 0)
+    var sink = RawSink(file = &file, offsets = try new u64[8] --- in memory.heap, at = 0, written = 0)
     defer free(sink.offsets) in memory.heap
     try read_cells(&tiles, cells, (void*)&sink, write_raw, warm = false)
     try file.close()
@@ -391,7 +391,7 @@ test "tiles backed by a document file leave the GPU and RAM without being writte
     assert(same_samples(before, after) and residency_report().fetches > fetched and disk_tile_bytes == disk_before)
     # Drawn into in place, a tile lets its backing go: the file no longer holds it.
     let drawn = tiles.tile(1, 0) else trap("a painted cell")
-    discard(try tiles.texture(1, 0))
+    _ = try tiles.texture(1, 0)
     try tiles.redrawn(1, 0)
     assert(drawn.source == none and source.references == 8)
     release_tile_source(source)

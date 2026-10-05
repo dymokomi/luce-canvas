@@ -39,7 +39,7 @@ pub struct Pyramid:
     pub var renders: u64
 
     ## Levels for stores on `device`, keeping at most `budget` bytes of them.
-    pub static func create(device: gpu.Device, budget: usize) -> Pyramid!:
+    pub func create(device: gpu.Device, budget: usize) -> Pyramid!:
         var shader = try gpu.Shader.create(device, halve_frag_words, halve_frag_msl)
         errdefer shader.destroy()
         var pipeline = try gpu.Pipeline.create(device, shader, gpu.Blend.replace, gpu.Format.rgba16_float)
@@ -48,18 +48,18 @@ pub struct Pyramid:
         return Pyramid(owner = device, shader = shader, pipeline = pipeline, cache = cache, renders = 0)
 
     ## Begin a request: every level tile it gets stays until the next one.
-    pub mutating func hold():
+    pub func hold():
         self.cache.hold()
 
     ## Cell (`column`, `row`) of `tiles` at `level`, borrowed until the next
     ## `hold`; none where nothing is (transparent, or for a `mask`, white).
-    pub mutating func texture(tiles: const Tiles*, column: u32, row: u32, level: u32, mask: bool = false) -> gpu.Texture?!:
+    pub func texture(tiles: const Tiles*, column: u32, row: u32, level: u32, mask: bool = false) -> gpu.Texture?!:
         return try self.level_tile(tiles, column, row, level, mask, true)
 
     ## As `texture`, for one pass making a derived tile: at level 0 a tile kept
     ## in RAM gets a transient upload (see `Tiles.pass_texture`) the caller
     ## releases once its pass is submitted.
-    pub mutating func pass_texture(tiles: const Tiles*, column: u32, row: u32, level: u32, mask: bool = false) -> gpu.Texture?!:
+    pub func pass_texture(tiles: const Tiles*, column: u32, row: u32, level: u32, mask: bool = false) -> gpu.Texture?!:
         if level == 0:
             return try tiles.pass_texture(column, row)
         return try self.level_tile(tiles, column, row, level, mask, true)
@@ -68,7 +68,7 @@ pub struct Pyramid:
     ## tile made on the way is kept as least wanted, so building one coarse tile
     ## (a level-4 tile makes 84 finer ones) does not push out the coarse tiles
     ## every frame needs.
-    mutating func level_tile(tiles: const Tiles*, column: u32, row: u32, level: u32, mask: bool, wanted: bool) -> gpu.Texture?!:
+    func level_tile(tiles: const Tiles*, column: u32, row: u32, level: u32, mask: bool, wanted: bool) -> gpu.Texture?!:
         if level == 0:
             return try tiles.texture(column, row)
         if level > 16:
@@ -111,7 +111,7 @@ pub struct Pyramid:
             var params: f32[5] = [(f32)x, (f32)y, (f32)covered[quarter * 2], (f32)covered[quarter * 2 + 1], 1.0 if mask else 0.0]
             try gpu.shade(target.value(), self.pipeline, gpu.Rect(x, y, half, half), u8[]((u8*)&params[0], 20), [part], gpu.Filter.nearest)
         # A quarter with nothing finer is empty: clear to what empty means.
-        discard(try frame.value().present(gpu.Color(1.0, 1.0, 1.0, 1.0) if mask else gpu.Color(0.0, 0.0, 0.0, 0.0)))
+        _ = try frame.value().present(gpu.Color(1.0, 1.0, 1.0, 1.0) if mask else gpu.Color(0.0, 0.0, 0.0, 0.0))
         self.renders += 1
         try self.cache.put(key, texture, tile_bytes, recent = wanted, precious = precious_level(tiles.width(), tiles.height(), level))
         return texture
@@ -135,7 +135,7 @@ pub struct Pyramid:
     ## Forget the level tiles over row `row` of `tiles`' cells, at every level,
     ## before that row changes: as a picture loads a band at a time, the tiles
     ## made from the rows so far would otherwise fill the cache.
-    pub mutating func forget_band(tiles: const Tiles*, row: u32, mask: bool):
+    pub func forget_band(tiles: const Tiles*, row: u32, mask: bool):
         var level: u32 = 1
         while level <= 16:
             let span = (u64)tile_size << level
@@ -152,14 +152,14 @@ pub struct Pyramid:
     pub func bytes() -> usize:
         return self.cache.bytes()
 
-    pub mutating func set_budget(budget: usize):
+    pub func set_budget(budget: usize):
         self.cache.set_budget(budget)
 
     ## Forget every level tile.
-    pub mutating func clear():
+    pub func clear():
         self.cache.clear()
 
-    pub mutating func destroy():
+    pub func destroy():
         self.cache.destroy()
         self.pipeline.destroy()
         self.shader.destroy()
@@ -222,7 +222,7 @@ test "a level averages in premultiplied space, is cached, and follows a painted 
     var tiles = try Tiles.create(device, 600, 300)
     defer tiles.destroy()
     let count = (usize)600 * 300 * 4
-    let pixels = try alloc f32[count] in memory.heap
+    let pixels = try new f32[count] --- in memory.heap
     defer free(pixels) in memory.heap
     for index in 0..<count:
         pixels[index] = 0.0
@@ -242,10 +242,10 @@ test "a level averages in premultiplied space, is cached, and follows a painted 
     assert(channel(bytes, 0) > 0.99 and channel(bytes, 1) < 0.01 and channel(bytes, 3) > 0.37 and channel(bytes, 3) < 0.38)
     # Empty cells have no level tile; the same request again is found.
     assert((try pyramid.texture(&tiles, 1, 0, 1)) == none and pyramid.renders == 1)
-    discard(try pyramid.texture(&tiles, 0, 0, 1))
+    _ = try pyramid.texture(&tiles, 0, 0, 1)
     assert(pyramid.renders == 1)
     # Level 2 covers everything through level 1.
-    discard(try pyramid.texture(&tiles, 0, 0, 2))
+    _ = try pyramid.texture(&tiles, 0, 0, 2)
     assert(pyramid.renders == 2)
     # Painting a tile changes its chain's keys.
     let before = level_key(&tiles, 0, 0, 2, false)

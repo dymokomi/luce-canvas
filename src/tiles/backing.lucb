@@ -81,9 +81,9 @@ func backed(tile: const Tile*) -> bool:
 ## Bring a backed tile's bytes into RAM from its file.
 func fetch_backed(tile: Tile*) -> !:
     let source = tile.source else return
-    let copy = try alloc u8[tile_bytes] in memory.heap
+    let copy = try new u8[tile_bytes] --- in memory.heap
     errdefer free(copy) in memory.heap
-    let packed = try alloc u8[(usize)tile.source_length] in memory.heap
+    let packed = try new u8[(usize)tile.source_length] --- in memory.heap
     defer free(packed) in memory.heap
     try read_record(source, tile.source_offset, packed)
     memory.set(copy, 0)
@@ -93,7 +93,7 @@ func fetch_backed(tile: Tile*) -> !:
     residency_fetches += 1
 
 func read_record(source: TileSource*, offset: u64, into: u8[]) -> !:
-    discard(try source.file.seek((i64)offset))
+    _ = try source.file.seek((i64)offset)
     var read: usize = 0
     while read < into.length:
         let count = try source.file.read(into[read..])
@@ -112,7 +112,7 @@ func fetch_many(tiles: Tile*[]) -> !:
         count += 1
     if count == 0:
         return
-    let jobs = try alloc FetchJob[count] in memory.heap
+    let jobs = try new FetchJob[count] --- in memory.heap
     # Only the jobs written so far are freed: a read that fails part way
     # leaves the rest of `jobs` as `alloc` gave it.
     var written: usize = 0
@@ -131,8 +131,8 @@ func fetch_many(tiles: Tile*[]) -> !:
         var no_bytes: u8[]
         jobs[at] = FetchJob(tile = tile, packed = no_bytes, copy = no_bytes, failed = false)
         written = at + 1
-        jobs[at].packed = try alloc u8[(usize)tile.source_length] in memory.heap
-        jobs[at].copy = try alloc u8[tile_bytes] in memory.heap
+        jobs[at].packed = try new u8[(usize)tile.source_length] --- in memory.heap
+        jobs[at].copy = try new u8[tile_bytes] --- in memory.heap
         memory.set(jobs[at].copy, 0)
         try read_record(source, tile.source_offset, jobs[at].packed)
         at += 1
@@ -168,7 +168,7 @@ func decode_jobs(share: FetchShare*):
         let job = &share.jobs[index]
         let source = job.tile.source else continue
         source.decode(source.context, job.packed, job.tile.source_rows, job.copy) catch failure:
-            discard(failure)
+            _ = failure
             job.failed = true
 
 ## Decode `jobs` on up to 16 threads, this one included.

@@ -61,7 +61,7 @@ func drop_packed(tile: Tile*):
 ## Decode `tile`'s compressed copy into RAM; the compressed copy stays.
 func unpack(tile: Tile*) -> !:
     let decode = codec_decode else error(invalid, "a compressed tile came back without a codec")
-    let copy = try alloc u8[tile_bytes] in memory.heap
+    let copy = try new u8[tile_bytes] --- in memory.heap
     errdefer free(copy) in memory.heap
     memory.set(copy, 0)
     try decode(codec_context, tile.packed, tile_size, copy)
@@ -90,12 +90,12 @@ func run_pack_jobs(share: PackShare*):
         if share.decoding:
             let decode = codec_decode else return
             decode(codec_context, job.tile.packed, tile_size, job.bytes) catch failure:
-                discard(failure)
+                _ = failure
                 job.failed = true
             continue
         let encode = codec_encode else return
         job.length = encode(codec_context, job.tile.ram, job.bytes) catch failure:
-            discard(failure)
+            _ = failure
             job.failed = true
             recover 0
 
@@ -120,7 +120,7 @@ func pack_many(tiles: Tile*[]) -> usize!:
     let jobs = try pack_jobs(tiles)
     defer release_pack_jobs(jobs)
     for index in 0..<jobs.length:
-        jobs[index].bytes = try alloc u8[codec_bound] in memory.heap
+        jobs[index].bytes = try new u8[codec_bound] --- in memory.heap
     try spread_pack(jobs, false)
     var freed: usize = 0
     for index in 0..<jobs.length:
@@ -128,8 +128,8 @@ func pack_many(tiles: Tile*[]) -> usize!:
         if job.failed or job.length == 0 or job.length > tile_bytes // 4 * 3:
             job.tile.raw_only = true
             continue
-        let packed = alloc u8[job.length] in memory.heap catch failure:
-            discard(failure)
+        let packed = new u8[job.length] --- in memory.heap catch failure:
+            _ = failure
             continue
         memory.copy(packed, job.bytes, job.length)
         job.tile.packed = packed
@@ -146,7 +146,7 @@ func unpack_many(tiles: Tile*[]) -> !:
     let jobs = try pack_jobs(tiles)
     defer release_pack_jobs(jobs)
     for index in 0..<jobs.length:
-        jobs[index].bytes = try alloc u8[tile_bytes] in memory.heap
+        jobs[index].bytes = try new u8[tile_bytes] --- in memory.heap
         memory.set(jobs[index].bytes, 0)
     try spread_pack(jobs, true)
     for index in 0..<jobs.length:
@@ -162,7 +162,7 @@ func unpack_many(tiles: Tile*[]) -> !:
 
 ## A job for each of `tiles`, holding no bytes yet.
 func pack_jobs(tiles: Tile*[]) -> PackJob[]!:
-    let jobs = try alloc PackJob[tiles.length] in memory.heap
+    let jobs = try new PackJob[tiles.length] --- in memory.heap
     for index in 0..<tiles.length:
         var no_bytes: u8[]
         jobs[index] = PackJob(tile = tiles[index], bytes = no_bytes, length = 0, failed = false)

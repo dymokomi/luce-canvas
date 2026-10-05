@@ -108,7 +108,7 @@ func keep_folder(directory: interop.Owned[str]):
         scratch_folder = directory
     else:
         files.remove_directory((c.str)directory.value) catch failure:
-            discard(failure)
+            _ = failure
         directory.release()
 
 ## On a clean exit: close the scratch file (Windows deletes it then) and remove
@@ -123,7 +123,7 @@ pub func release_scratch():
     disk_tile_bytes = 0
     if let folder = scratch_folder:
         files.remove_directory((c.str)folder.value) catch failure:
-            discard(failure)
+            _ = failure
         folder.release()
         scratch_folder = none
 
@@ -135,14 +135,14 @@ pub func release_scratch():
 func sweep_stale(root: str):
     if platform.windows:
         let names = files.list((c.str)root) catch failure:
-            discard(failure)
+            _ = failure
             return
         defer names.release()
         for name in names.value:
             if not is_scratch_folder(name):
                 continue
             let folder = paths.join(root, name) catch failure:
-                discard(failure)
+                _ = failure
                 continue
             remove_stale_folder(folder.value)
             folder.release()
@@ -152,21 +152,21 @@ func sweep_stale(root: str):
 ## Remove `folder` if it holds at most a scratch file.
 func remove_stale_folder(folder: str):
     let inside = files.list((c.str)folder) catch failure:
-        discard(failure)
+        _ = failure
         return
     defer inside.release()
     if not only_scratch(inside.value):
         return
     if inside.value.length == 1:
         let file = paths.join(folder, scratch_name) catch failure:
-            discard(failure)
+            _ = failure
             return
         defer file.release()
         files.remove_file((c.str)file.value) catch failure:
-            discard(failure)
+            _ = failure
             return
     files.remove_directory((c.str)folder) catch failure:
-        discard(failure)
+        _ = failure
 
 ## Whether `name` is a folder `create_temporary_directory` makes: `.luce-` and 32
 ## lower-case hexadecimal digits.
@@ -194,7 +194,7 @@ func take_slot() -> i64!:
 
 func give_slot(offset: i64) -> !:
     if free_count == free_slots.length:
-        let grown = try alloc i64[free_slots.length * 2 + 64] in memory.heap
+        let grown = try new i64[free_slots.length * 2 + 64] --- in memory.heap
         memory.copy(grown, free_slots, free_count)
         if free_slots.length > 0:
             free(free_slots) in memory.heap
@@ -212,7 +212,7 @@ func spill(tile: Tile*) -> !:
         let file = try scratch_file()
         let offset = try take_slot()
         errdefer try_give_slot(offset)
-        discard(try file.seek(offset))
+        _ = try file.seek(offset)
         var written: usize = 0
         while written < tile_bytes:
             let count = try file.write(tile.ram[written..])
@@ -235,7 +235,7 @@ func spill_packed(tile: Tile*) -> !:
         let file = try scratch_file()
         let offset = try take_slot()
         errdefer try_give_slot(offset)
-        discard(try file.seek(offset))
+        _ = try file.seek(offset)
         var written: usize = 0
         while written < tile.packed.length:
             let count = try file.write(tile.packed[written..])
@@ -252,16 +252,16 @@ func spill_packed(tile: Tile*) -> !:
 func load_packed_slot(tile: Tile*) -> !:
     let decode = codec_decode else error(invalid, "a compressed tile came back without a codec")
     let file = try scratch_file()
-    let packed = try alloc u8[(usize)tile.disk_length] in memory.heap
+    let packed = try new u8[(usize)tile.disk_length] --- in memory.heap
     defer free(packed) in memory.heap
-    discard(try file.seek(tile.disk))
+    _ = try file.seek(tile.disk)
     var read: usize = 0
     while read < packed.length:
         let count = try file.read(packed[read..])
         if count == 0:
             error(invalid, "the scratch file ended inside a tile")
         read += count
-    let copy = try alloc u8[tile_bytes] in memory.heap
+    let copy = try new u8[tile_bytes] --- in memory.heap
     errdefer free(copy) in memory.heap
     memory.set(copy, 0)
     try decode(codec_context, packed, tile_size, copy)
@@ -271,7 +271,7 @@ func load_packed_slot(tile: Tile*) -> !:
 
 func try_give_slot(offset: i64):
     give_slot(offset) catch failure:
-        discard(failure)
+        _ = failure
 
 ## Bring `tile`'s bytes back into RAM from its slot, if they are only on disk;
 ## the slot stays, so spilling it again is free.
@@ -288,9 +288,9 @@ func ensure_ram(tile: Tile*) -> !:
         try load_packed_slot(tile)
         return
     let file = try scratch_file()
-    let copy = try alloc u8[tile_bytes] in memory.heap
+    let copy = try new u8[tile_bytes] --- in memory.heap
     errdefer free(copy) in memory.heap
-    discard(try file.seek(tile.disk))
+    _ = try file.seek(tile.disk)
     var read: usize = 0
     while read < tile_bytes:
         let count = try file.read(copy[read..])

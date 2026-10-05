@@ -38,8 +38,8 @@ pub struct Job:
     var after: Job*? = none
 
 func skip_item(context: void*?, index: usize):
-    discard(context)
-    discard(index)
+    _ = context
+    _ = index
 
 ## Batches with items still to hand out, oldest first; guarded by `lock`.
 var lock: sync.Mutex
@@ -127,7 +127,7 @@ func work_on(job: Job*):
             return
         let entry = job.entry
         entry(job.context, index)
-        discard(job.finished.add(1, .acq_rel))
+        _ = job.finished.add(1, .acq_rel)
 
 ## Drop `job` from the queue if it is there; under `lock`.
 func unlink(job: Job*):
@@ -159,7 +159,7 @@ func ensure_workers():
     for _ in 0..<wanted:
         let handle = thread.spawn(worker_main, none, name = "luce-pool") catch failure:
             # Fewer workers only means less help: callers do the rest.
-            discard(failure)
+            _ = failure
             break
         handle.detach()
         worker_count += 1
@@ -178,7 +178,7 @@ func next_job() -> Job*?:
     return none
 
 func worker_main(context: void*?):
-    discard(context)
+    _ = context
     lock.lock()
     while true:
         if let job = next_job():
@@ -198,11 +198,11 @@ struct Tally:
 
 func count_item(context: void*?, index: usize):
     let tally = (Tally*)(context else return)
-    discard(tally.hits.add(1, .relaxed))
-    discard(tally.seen.add((u64)1 << (u64)(index % 64), .relaxed))
+    _ = tally.hits.add(1, .relaxed)
+    _ = tally.seen.add((u64)1 << (u64)(index % 64), .relaxed)
 
 func nested_item(context: void*?, index: usize):
-    discard(index)
+    _ = index
     # Each item runs a batch of its own: every worker may be busy in the outer
     # one, so the inner caller must be able to finish it alone.
     run(8, count_item, context)

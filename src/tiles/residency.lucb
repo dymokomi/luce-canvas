@@ -103,10 +103,10 @@ func pass_texture(tile: Tile*, device: gpu.Device) -> gpu.Texture!:
 
 func keep_transient(texture: gpu.Texture) -> !:
     if transient_store == none:
-        transient_store = try new Transients(textures = try alloc gpu.Texture[64] in memory.heap, count = 0) in memory.heap
+        transient_store = try new Transients(textures = try new gpu.Texture[64] --- in memory.heap, count = 0) in memory.heap
     let store = transient_store else trap("made")
     if store.count == store.textures.length:
-        let grown = try alloc gpu.Texture[store.textures.length * 2] in memory.heap
+        let grown = try new gpu.Texture[store.textures.length * 2] --- in memory.heap
         memory.copy(grown, store.textures, store.count)
         free(store.textures) in memory.heap
         store.textures = grown
@@ -174,8 +174,8 @@ func try_tile_texture(device: gpu.Device) -> gpu.Texture?!:
 func keep_warm(tile: Tile*, bytes: const u8[]):
     if tile.ram.length > 0 or bytes.length != tile_bytes or not warm_room():
         return
-    let copy = alloc u8[tile_bytes] in memory.heap catch failure:
-        discard(failure)
+    let copy = new u8[tile_bytes] --- in memory.heap catch failure:
+        _ = failure
         return
     memory.copy(copy, bytes, tile_bytes)
     tile.ram = copy
@@ -192,9 +192,9 @@ func demote(device: gpu.Device, tiles: Tile*[]) -> usize!:
     let per_batch = batch.capacity() // tile_bytes
     if per_batch == 0:
         error(invalid, "a read batch cannot hold one tile")
-    let offsets = try alloc usize[per_batch] in memory.heap
+    let offsets = try new usize[per_batch] --- in memory.heap
     defer free(offsets) in memory.heap
-    let waiting = try alloc Tile*[per_batch] in memory.heap
+    let waiting = try new Tile*[per_batch] --- in memory.heap
     defer free(waiting) in memory.heap
     var at: usize = 0
     while at < tiles.length:
@@ -223,8 +223,8 @@ func demote(device: gpu.Device, tiles: Tile*[]) -> usize!:
         try batch.wait()
         for index in 0..<count:
             let tile = waiting[index]
-            let copy = alloc u8[tile_bytes] in memory.heap catch failure:
-                discard(failure)
+            let copy = new u8[tile_bytes] --- in memory.heap catch failure:
+                _ = failure
                 continue
             memory.copy(copy, try batch.bytes(offsets[index], tile_bytes), tile_bytes)
             tile.ram = copy

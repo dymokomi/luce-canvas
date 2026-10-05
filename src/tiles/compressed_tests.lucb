@@ -2,7 +2,7 @@
 # (texel, count) records. A one-color tile packs to 12 bytes; noise does not pack.
 
 func runs_encode(context: void*?, texels: const u8[], into: u8[]) -> usize!:
-    discard(context)
+    _ = context
     var at: usize = 0
     var written: usize = 0
     while at < texels.length:
@@ -30,8 +30,8 @@ func runs_encode(context: void*?, texels: const u8[], into: u8[]) -> usize!:
     return written
 
 func runs_decode(context: void*?, packed: const u8[], rows: u32, into: u8[]) -> !:
-    discard(context)
-    discard(rows)
+    _ = context
+    _ = rows
     var at: usize = 0
     var out: usize = 0
     while at + 12 <= packed.length:
@@ -42,7 +42,7 @@ func runs_decode(context: void*?, packed: const u8[], rows: u32, into: u8[]) -> 
             for index in 0..<(usize)8:
                 into[out + index] = packed[at + index]
             out += 8
-            discard(count)
+            _ = count
         at += 12
     if out != into.length:
         error(invalid, "a packed tile came back short")
@@ -52,7 +52,7 @@ func patched_layer(device: gpu.Device) -> Tiles!:
     var tiles = try Tiles.create(device, 1024, 512)
     errdefer tiles.destroy()
     let count = (usize)1024 * 512 * 4
-    let pixels = try alloc f32[count] in memory.heap
+    let pixels = try new f32[count] --- in memory.heap
     defer free(pixels) in memory.heap
     var noise: u32 = 12345
     for y in 0..<(usize)512:
@@ -124,7 +124,7 @@ test "packing keeps only the compressed copy in RAM, and unpacking many brings e
             list[count] = tile
             count += 1
     residency_advance()
-    discard(try demote(device, list[..<count]))
+    _ = try demote(device, list[..<count])
     let held = packed_tile_bytes
     let freed = try pack_many(list[..<count])
     # Seven one-color cells of 12 bytes each; the noise cell keeps its whole copy.

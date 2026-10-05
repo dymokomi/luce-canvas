@@ -19,13 +19,13 @@ pub struct KeyMap:
     var count: usize
 
     ## A table for up to `capacity` keys.
-    pub static func create(capacity: usize) -> KeyMap!:
+    pub func create(capacity: usize) -> KeyMap!:
         var size: usize = 16
         while size < capacity * 2:
             size *= 2
-        let keys = try alloc u64[size] in memory.heap
+        let keys = try new u64[size] --- in memory.heap
         errdefer free(keys) in memory.heap
-        let slots = try alloc u32[size] in memory.heap
+        let slots = try new u32[size] --- in memory.heap
         for index in 0..<size:
             keys[index] = 0
             slots[index] = 0
@@ -44,7 +44,7 @@ pub struct KeyMap:
         return none
 
     ## Keep `slot` for `key`, replacing what was kept for it.
-    pub mutating func put(key: u64, slot: u32) -> !:
+    pub func put(key: u64, slot: u32) -> !:
         if key == 0:
             error(invalid, "zero is not a key")
         let mask = self.keys.length - 1
@@ -61,7 +61,7 @@ pub struct KeyMap:
         self.count += 1
 
     ## Forget `key`, if kept.
-    pub mutating func remove(key: u64):
+    pub func remove(key: u64):
         if key == 0:
             return
         let mask = self.keys.length - 1
@@ -88,12 +88,12 @@ pub struct KeyMap:
     pub func size() -> usize:
         return self.count
 
-    pub mutating func clear():
+    pub func clear():
         for index in 0..<self.keys.length:
             self.keys[index] = 0
         self.count = 0
 
-    pub mutating func destroy():
+    pub func destroy():
         if self.keys.length > 0:
             free(self.keys) in memory.heap
             free(self.slots) in memory.heap

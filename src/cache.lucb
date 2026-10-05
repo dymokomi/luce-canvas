@@ -53,11 +53,11 @@ pub struct TileCache:
 
     ## A cache keeping at most `budget` bytes of tiles (`smallest` bytes the
     ## smallest a tile is, which sets how many entries it may need).
-    pub static func create(budget: usize, smallest: usize = 131072) -> TileCache!:
+    pub func create(budget: usize, smallest: usize = 131072) -> TileCache!:
         if budget == 0 or smallest == 0:
             error(invalid, "a tile cache needs a budget")
         let capacity = max_usize(64, budget // smallest + 64)
-        let entries = try alloc CacheEntry[capacity] in memory.heap
+        let entries = try new CacheEntry[capacity] --- in memory.heap
         errdefer free(entries) in memory.heap
         for index in 0..<capacity:
             entries[index] = CacheEntry(key = 0, texture = gpu.Texture(), bytes = 0, used = 0, recent = false, live = false, precious = false)
@@ -66,7 +66,7 @@ pub struct TileCache:
         return TileCache(entries = entries, map = map, budget = budget, held_bytes = 0, precious_bytes = 0, tick = 1, guard = 1, hand = 0, misses = 0, hits = 0)
 
     ## Begin a request: what it uses from now on stays until the next `hold`.
-    pub mutating func hold():
+    pub func hold():
         self.tick += 1
         self.guard = self.tick
         # While the GPU is short, give back what the governor asks for.
@@ -78,7 +78,7 @@ pub struct TileCache:
         return self.map.find(key) != none
 
     ## The tile kept for `key`, borrowed; none when it is not kept.
-    pub mutating func find(key: u64) -> gpu.Texture?:
+    pub func find(key: u64) -> gpu.Texture?:
         let slot = self.map.find(key) else return none
         let at = (usize)slot
         self.entries[at].used = self.tick
@@ -90,7 +90,7 @@ pub struct TileCache:
     ## Not `recent`, it is the first to go once its request is done: a tile
     ## made only on the way to another (a pyramid's finer levels). A `precious`
     ## one goes only after every other tile.
-    pub mutating func put(key: u64, texture: gpu.Texture, bytes: usize, recent: bool = true, precious: bool = false) -> !:
+    pub func put(key: u64, texture: gpu.Texture, bytes: usize, recent: bool = true, precious: bool = false) -> !:
         self.misses += 1
         if let existing = self.map.find(key):
             self.drop((usize)existing)
@@ -109,7 +109,7 @@ pub struct TileCache:
     ## Drop the tile kept for `key`, if any: one about to be made again from
     ## changed tiles, which would only take room until it was pushed out. One a
     ## request still holds stays, first to go.
-    pub mutating func forget(key: u64):
+    pub func forget(key: u64):
         let slot = self.map.find(key) else return
         let at = (usize)slot
         if self.entries[at].used >= self.guard:
@@ -121,13 +121,13 @@ pub struct TileCache:
     ## fit: every ordinary tile before any precious one, and precious tiles only
     ## while they alone are over the budget. Each sweep is bounded: at most two
     ## turns of the clock.
-    mutating func make_room(bytes: usize):
+    func make_room(bytes: usize):
         let limit = self.limit()
         self.sweep(bytes, limit, false)
         if self.held_bytes + bytes > limit and self.precious_bytes + bytes > limit:
             self.sweep(bytes, limit, true)
 
-    mutating func sweep(bytes: usize, limit: usize, precious: bool):
+    func sweep(bytes: usize, limit: usize, precious: bool):
         var passes: usize = 0
         while self.held_bytes + bytes > limit and passes < self.entries.length * 2:
             let at = self.hand
@@ -149,9 +149,9 @@ pub struct TileCache:
                 return at
         return none
 
-    mutating func grow() -> !:
+    func grow() -> !:
         let capacity = self.entries.length * 2
-        let entries = try alloc CacheEntry[capacity] in memory.heap
+        let entries = try new CacheEntry[capacity] --- in memory.heap
         errdefer free(entries) in memory.heap
         var map = try KeyMap.create(capacity)
         errdefer map.destroy()
@@ -166,7 +166,7 @@ pub struct TileCache:
         self.entries = entries
         self.map = map
 
-    mutating func drop(at: usize):
+    func drop(at: usize):
         if not self.entries[at].live:
             return
         self.map.remove(self.entries[at].key)
@@ -186,15 +186,15 @@ pub struct TileCache:
         return self.held_bytes
 
     ## Change the budget; the cache settles to it as tiles come in.
-    pub mutating func set_budget(budget: usize):
+    pub func set_budget(budget: usize):
         self.budget = max_usize(budget, 1)
 
     ## Forget every tile.
-    pub mutating func clear():
+    pub func clear():
         for index in 0..<self.entries.length:
             self.drop(index)
 
-    pub mutating func destroy():
+    pub func destroy():
         self.clear()
         if self.entries.length > 0:
             free(self.entries) in memory.heap
@@ -225,7 +225,7 @@ test "the cache keeps within its budget, drops the least wanted, and keeps what 
     # Everything held by one request: the cache grows past its budget rather than fail.
     cache.hold()
     for key in 1..<(u64)6:
-        discard(cache.find(key))
+        _ = cache.find(key)
     for key in 6..<(u64)12:
         try cache.put(key, try gpu.Texture.create(device, 16, 16, gpu.Format.rgba8_linear), 1024)
     assert(cache.bytes() > 4096)

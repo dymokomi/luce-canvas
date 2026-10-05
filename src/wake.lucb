@@ -27,7 +27,7 @@ pub func wake_frames():
 var test_wakes: @usize
 
 func count_wake():
-    discard(test_wakes.add(1, .relaxed))
+    _ = test_wakes.add(1, .relaxed)
 
 test "a registered wake is called; none stops it":
     wake_frames()

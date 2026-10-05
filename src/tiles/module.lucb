@@ -129,16 +129,16 @@ pub struct Tiles:
     var outside_row: i64
 
     ## Fully transparent pixels for a `width` by `height` layer.
-    pub static func create(device: gpu.Device, width: u32, height: u32) -> Tiles!:
+    pub func create(device: gpu.Device, width: u32, height: u32) -> Tiles!:
         if width == 0 or height == 0 or width > 65536 or height > 65536:
             error(invalid, "layer dimensions must be in 1..65536")
         let columns = tile_columns(width)
         let rows = tile_columns(height)
-        let cells = try alloc Tile*?[(usize)columns * (usize)rows] in memory.heap
+        let cells = try new Tile*?[(usize)columns * (usize)rows] --- in memory.heap
         for index in 0..<cells.length:
             cells[index] = none
         var owned = device
-        discard(try owned.backend())
+        _ = try owned.backend()
         return Tiles(owner = device, extent_x = width, extent_y = height, cell_columns = columns, cell_rows = rows, cells = cells, outside = none, outside_column = 0, outside_row = 0)
 
     pub func width() -> u32:
@@ -195,7 +195,7 @@ pub struct Tiles:
 
     ## A second holder of the same tiles.
     pub func clone() -> Tiles!:
-        let cells = try alloc Tile*?[self.cells.length] in memory.heap
+        let cells = try new Tile*?[self.cells.length] --- in memory.heap
         for index in 0..<cells.length:
             cells[index] = none
             if let tile = self.cells[index]:
@@ -211,7 +211,7 @@ pub struct Tiles:
 
     ## Put `texture` (a full 256 by 256 rgba16_float texture this takes over) at a
     ## cell, replacing what was there. Other holders keep the old tile.
-    pub mutating func set(column: u32, row: u32, texture: gpu.Texture) -> !:
+    pub func set(column: u32, row: u32, texture: gpu.Texture) -> !:
         let index = try self.index(column, row)
         if (try texture.width()) != tile_size or (try texture.height()) != tile_size or (try texture.pixel_format()) != gpu.Format.rgba16_float:
             error(invalid, "a tile is a 256 by 256 rgba16_float texture")
@@ -223,7 +223,7 @@ pub struct Tiles:
     ## Put the tile of cell (`from_column`, `from_row`) at (`column`, `row`) too,
     ## shared: a store of many equal cells (a selection's fully selected ones)
     ## keeps one tile for them all. An empty source empties the cell.
-    pub mutating func share(column: u32, row: u32, from_column: u32, from_row: u32) -> !:
+    pub func share(column: u32, row: u32, from_column: u32, from_row: u32) -> !:
         let index = try self.index(column, row)
         let source = self.cells[try self.index(from_column, from_row)]
         if let previous = self.cells[index]:
@@ -257,7 +257,7 @@ pub struct Tiles:
     ## The cell's tile, held here alone, was drawn into again on the GPU: a new
     ## stamp, and the RAM copy and scratch slot of what it held before are let
     ## go, so a read or a reload never serves the old pixels.
-    pub mutating func redrawn(column: u32, row: u32) -> !:
+    pub func redrawn(column: u32, row: u32) -> !:
         let tile = self.tile(column, row) else error(invalid, "no tile to redraw")
         if tile.references != 1:
             error(invalid, "a shared tile cannot be redrawn")
@@ -271,7 +271,7 @@ pub struct Tiles:
             release_disk(tile)
 
     ## Make a cell transparent again.
-    pub mutating func clear(column: u32, row: u32) -> !:
+    pub func clear(column: u32, row: u32) -> !:
         let index = try self.index(column, row)
         if let previous = self.cells[index]:
             release(previous)
@@ -285,21 +285,21 @@ pub struct Tiles:
         # Cleared on the device: no zeros filled and copied up from memory.
         let frame = try texture.frame()
         defer frame.release()
-        discard(try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0)))
+        _ = try frame.value().present(gpu.Color(0.0, 0.0, 0.0, 0.0))
         return texture
 
     ## Replace every pixel from straight-alpha RGBA f32 samples, top-down, four
     ## per pixel. Transparent tiles stay `none`. A row of cells at a time is
     ## converted to half floats on every processor, then uploaded whole (the
     ## padding past the extent zeroed), so no tile needs clearing first.
-    pub mutating func write(pixels: const f32[]) -> !:
+    pub func write(pixels: const f32[]) -> !:
         if pixels.length != (usize)self.extent_x * (usize)self.extent_y * 4:
             error(invalid, "pixel data must hold width * height RGBA samples")
         let columns = (usize)self.cell_columns
         let per_tile = (usize)tile_size * (usize)tile_size * 8
-        let band = try alloc u8[columns * per_tile] in memory.heap
+        let band = try new u8[columns * per_tile] --- in memory.heap
         defer free(band) in memory.heap
-        let painted = try alloc bool[columns] in memory.heap
+        let painted = try new bool[columns] --- in memory.heap
         defer free(painted) in memory.heap
         for row in 0..<self.cell_rows:
             try self.write_cells_of(row, pixels, 0, band, painted)
@@ -308,17 +308,17 @@ pub struct Tiles:
     ## samples of the rows that row of cells covers only (256 of them, fewer in
     ## the last), the document's width. What a picture loads through a band at a
     ## time, never whole.
-    pub mutating func write_band(row: u32, pixels: const f32[]) -> !:
-        let band = try alloc u8[packed_band_bytes(self.extent_x)] in memory.heap
+    pub func write_band(row: u32, pixels: const f32[]) -> !:
+        let band = try new u8[packed_band_bytes(self.extent_x)] --- in memory.heap
         defer free(band) in memory.heap
-        let painted = try alloc bool[(usize)self.cell_columns] in memory.heap
+        let painted = try new bool[(usize)self.cell_columns] --- in memory.heap
         defer free(painted) in memory.heap
         try pack_band(self.extent_x, self.extent_y, row, pixels, band, painted)
         try self.write_packed(row, band, painted)
 
     ## Replace row `row` of cells with the tiles `pack_band` made: each painted
     ## one uploaded, the others cleared. The GPU half of `write_band`.
-    pub mutating func write_packed(row: u32, band: const u8[], painted: const bool[]) -> !:
+    pub func write_packed(row: u32, band: const u8[], painted: const bool[]) -> !:
         let per_tile = (usize)tile_size * (usize)tile_size * 8
         if row >= self.cell_rows or band.length < (usize)self.cell_columns * per_tile or painted.length < (usize)self.cell_columns:
             error(invalid, "a packed band holds a tile for each of its row's cells")
@@ -333,7 +333,7 @@ pub struct Tiles:
             try self.set(column, row, texture)
 
     ## Row `row` of cells from `pixels`, whose first row is document row `origin`.
-    mutating func write_cells_of(row: u32, pixels: const f32[], origin: usize, band: u8[], painted: bool[]) -> !:
+    func write_cells_of(row: u32, pixels: const f32[], origin: usize, band: u8[], painted: bool[]) -> !:
         let columns = (usize)self.cell_columns
         var job = WriteJob(pixels = pixels, band = band, painted = painted, extent_x = self.extent_x, extent_y = self.extent_y, row = row, origin = origin, first = 0, last = columns)
         try run_bands(&job, columns)
@@ -342,11 +342,11 @@ pub struct Tiles:
     ## Replace cell (`column`, `row`) with `pixels`, one cell's premultiplied
     ## RGBA f32 samples, 256 rows of 256 whatever the cell's size (past the
     ## document's edge they are ignored); a cell left wholly clear is dropped.
-    pub mutating func write_cell_premultiplied(column: u32, row: u32, pixels: const f32[]) -> !:
+    pub func write_cell_premultiplied(column: u32, row: u32, pixels: const f32[]) -> !:
         if pixels.length != (usize)tile_size * (usize)tile_size * 4:
             error(invalid, "a cell's pixels are 256 by 256 RGBA samples")
         let area = self.region(column, row)
-        let bytes = try alloc u8[(usize)tile_size * (usize)tile_size * 8] in memory.heap
+        let bytes = try new u8[(usize)tile_size * (usize)tile_size * 8] --- in memory.heap
         defer free(bytes) in memory.heap
         for index in 0..<bytes.length:
             bytes[index] = 0
@@ -396,7 +396,7 @@ pub struct Tiles:
             error(invalid, "pixel buffer must hold width * height RGBA samples")
         for index in 0..<pixels.length:
             pixels[index] = 0.0
-        let cells = try alloc Cell[(usize)self.cell_columns * (usize)self.cell_rows] in memory.heap
+        let cells = try new Cell[(usize)self.cell_columns * (usize)self.cell_rows] --- in memory.heap
         defer free(cells) in memory.heap
         var count: usize = 0
         for row in 0..<self.cell_rows:
@@ -486,7 +486,7 @@ pub struct Tiles:
 
     ## Make the outside grid cover `range` as well as what it covers already,
     ## its tiles kept.
-    pub mutating func cover(range: CellRange) -> !:
+    pub func cover(range: CellRange) -> !:
         var wanted = range
         if let outside = self.outside:
             let right = self.outside_column + (i64)outside.cell_columns
@@ -520,7 +520,7 @@ pub struct Tiles:
     ## (`inside`), into the outside grid when its part past the canvas does
     ## (`beyond`; `cover` it first) — one shared tile for both — and nowhere
     ## when neither.
-    pub mutating func place(column: i64, row: i64, texture: gpu.Texture, inside: bool, beyond: bool) -> !:
+    pub func place(column: i64, row: i64, texture: gpu.Texture, inside: bool, beyond: bool) -> !:
         let keep_inside = inside and self.on_canvas(column, row)
         let keep_beyond = beyond and self.reaches_past(column, row)
         if not keep_inside and not keep_beyond:
@@ -549,9 +549,9 @@ pub struct Tiles:
     ## any alpha, or for a `mask` nothing but white — and drop the outside
     ## grid if nothing is left. Rebuilding places whole pieces, so a cell can
     ## hold only the transparent margin of one; this reads them back to know.
-    pub mutating func settle(mask: bool = false) -> !:
+    pub func settle(mask: bool = false) -> !:
         let outside = self.outside else return
-        let bytes = try alloc u8[(usize)tile_size * (usize)tile_size * 8] in memory.heap
+        let bytes = try new u8[(usize)tile_size * (usize)tile_size * 8] --- in memory.heap
         defer free(bytes) in memory.heap
         var kept = false
         for row in 0..<outside.cell_rows:
@@ -599,7 +599,7 @@ pub struct Tiles:
             error(invalid, "tile cell out of range")
         return (usize)row * (usize)self.cell_columns + (usize)column
 
-    pub mutating func destroy():
+    pub func destroy():
         if let outside = self.outside:
             self.outside = none
             unbox(outside)
@@ -724,5 +724,5 @@ pub func flatten(device: gpu.Device, tiles: const Tiles*, empty: gpu.Color = gpu
             let texture = (try tiles.texture(column, row)) else continue
             let area = tiles.region(column, row)
             try gpu.copy_image(whole.value(), texture, gpu.Rect((f64)(column * tile_size), (f64)(row * tile_size), (f64)area.width, (f64)area.height), area)
-    discard(try frame.value().present(empty))
+    _ = try frame.value().present(empty)
     return flat

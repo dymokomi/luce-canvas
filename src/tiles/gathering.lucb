@@ -58,10 +58,10 @@ func load_packed_slots(list: Tile*[]) -> !:
         for tile in list:
             drop_packed(tile)
     for tile in list:
-        let packed = try alloc u8[(usize)tile.disk_length] in memory.heap
+        let packed = try new u8[(usize)tile.disk_length] --- in memory.heap
         tile.packed = packed
         packed_tile_bytes += packed.length
-        discard(try file.seek(tile.disk))
+        _ = try file.seek(tile.disk)
         var read: usize = 0
         while read < packed.length:
             let count = try file.read(packed[read..])
@@ -81,25 +81,25 @@ pub struct Gathering:
     var waiting: Tile*[]
     var waiting_count: usize
 
-    pub static func create() -> Gathering:
+    pub func create() -> Gathering:
         var list: Tile*[64] = ---
         var none_waiting: Tile*[]
         return Gathering(list = list, count = 0, later = false, waiting = none_waiting, waiting_count = 0)
 
-    pub static func deferred() -> Gathering:
+    pub func deferred() -> Gathering:
         var gathering = Gathering.create()
         gathering.later = true
         return gathering
 
     ## Add the tile at cell (`column`, `row`) of `tiles`, if it has one that
     ## is neither on the GPU nor in RAM.
-    pub mutating func add(tiles: const Tiles*, column: u32, row: u32) -> !:
+    pub func add(tiles: const Tiles*, column: u32, row: u32) -> !:
         let tile = tiles.tile(column, row) else return
         if tile.on_gpu or tile.ram.length > 0:
             return
         if self.later:
             if self.waiting_count == self.waiting.length:
-                let grown = try alloc Tile*[max_usize(64, self.waiting.length * 2)] in memory.heap
+                let grown = try new Tile*[max_usize(64, self.waiting.length * 2)] --- in memory.heap
                 if self.waiting_count > 0:
                     memory.copy(grown, self.waiting, self.waiting_count)
                     free(self.waiting) in memory.heap
@@ -118,17 +118,17 @@ pub struct Gathering:
 
     ## Bring back the tiles still waiting; a deferred gathering starts them
     ## decoding in the background (unless a batch is already out).
-    pub mutating func finish() -> !:
+    pub func finish() -> !:
         if self.later:
             defer self.release()
-            discard(try prefetch_tiles(self.waiting[..<self.waiting_count]))
+            _ = try prefetch_tiles(self.waiting[..<self.waiting_count])
             return
         let count = self.count
         self.count = 0
         try gather_tiles(self.list[..<count])
 
     ## Let go of a deferred gathering's list without starting anything.
-    pub mutating func release():
+    pub func release():
         if self.waiting.length > 0:
             free(self.waiting) in memory.heap
         var none_waiting: Tile*[]
