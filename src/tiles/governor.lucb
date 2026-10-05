@@ -104,10 +104,12 @@ pub func residency_configure(device: gpu.Device, usage: f64) -> !:
     ram_budget = (usize)((f64)physical_memory() * usage)
 
 ## Set the budgets directly, in bytes, 0 for none: tests, and forcing a
-## small budget to see the governor work.
+## small budget to see the governor work. Derived caches start again at their
+## full share of the new budgets.
 pub func residency_budgets(gpu_bytes: usize, ram_bytes: usize):
     gpu_budget = gpu_bytes
     ram_budget = ram_bytes
+    cache_scale_now = 1.0
 
 ## Begin a new epoch: what earlier ones pinned may move again. For work
 ## outside frames (headless steps, tests); a view calls `residency_frame`.
