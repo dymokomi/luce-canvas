@@ -38,7 +38,7 @@ fast on ordinary machines. The design is in luced-2d's
 ## Testing
 
 ```
-./test.sh
+luc test
 ```
 
 This runs every module's tests on the native and C backends. GPU tests skip themselves
